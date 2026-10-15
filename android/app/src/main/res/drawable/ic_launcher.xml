@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Red speaker glyph on near-black, matching the in-app header icon. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp" android:height="108dp"
+    android:viewportWidth="108" android:viewportHeight="108">
+    <path android:fillColor="#121212" android:pathData="M0,0h108v108h-108z"/>
+    <path android:fillColor="#EF3A2D"
+        android:pathData="M36,26h26a5,5 0 0 1 5,5v46a5,5 0 0 1 -5,5h-26a5,5 0 0 1 -5,-5v-46a5,5 0 0 1 5,-5z"/>
+    <path android:fillColor="#121212" android:pathData="M49,62m-9,0a9,9 0 1 1 18,0a9,9 0 1 1 -18,0"/>
+    <path android:fillColor="#EF3A2D" android:pathData="M49,62m-4,0a4,4 0 1 1 8,0a4,4 0 1 1 -8,0"/>
+    <path android:fillColor="#121212" android:pathData="M49,40m-4,0a4,4 0 1 1 8,0a4,4 0 1 1 -8,0"/>
+    <path android:strokeColor="#EF3A2D" android:strokeWidth="4" android:fillColor="#00000000"
+        android:pathData="M73,44a14,14 0 0 1 0,20"/>
+    <path android:strokeColor="#EF3A2D" android:strokeAlpha="0.6" android:strokeWidth="4" android:fillColor="#00000000"
+        android:pathData="M79,38a22,22 0 0 1 0,32"/>
+</vector>

@@ -1,0 +1,34 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "SpeakerBridge device",
+  "description": "Shape of one device in a scan export (Linux --json / GUI export). Android uses the same fields. Will be the payload of the v0.2+ WebSocket control channel.",
+  "type": "object",
+  "required": ["ip", "key", "status", "protocols"],
+  "properties": {
+    "ip": { "type": "string" },
+    "key": { "type": "string", "description": "Stable id, e.g. googlecast:<id>, dlna_renderer:uuid:<udn>, or ip:<addr> as a fallback" },
+    "name": { "type": "string" },
+    "manufacturer": { "type": "string" },
+    "model": { "type": "string" },
+    "device_id": { "type": "string" },
+    "is_cast_group": { "type": "boolean" },
+    "looks_like_non_speaker": { "type": "boolean" },
+    "status": { "enum": ["verified", "group", "ready_to_test", "control_only", "not_speaker"] },
+    "sync_tier": { "type": "integer", "minimum": 1, "maximum": 3, "description": "Best-case tier from the spec: 1 native sync, 2 calibrated, 3 unsupported" },
+    "notes": { "type": "array", "items": { "type": "string" } },
+    "raw_types": { "type": "array", "items": { "type": "string" } },
+    "protocols": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "protocol": { "type": "string" },
+          "source": { "enum": ["mdns", "ssdp"] },
+          "service_name": { "type": "string" },
+          "port": { "type": "integer" },
+          "details": { "type": "object" }
+        }
+      }
+    }
+  }
+}

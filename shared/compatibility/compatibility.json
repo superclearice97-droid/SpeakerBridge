@@ -1,0 +1,112 @@
+{
+  "schema_version": 1,
+  "notes": "Single source of truth for protocol signatures and brand hints. Used by the Linux app directly and bundled into the Android app at build time. Discovery only proves a device advertises a protocol; it never proves SpeakerBridge can play audio on it. Verified playback is recorded per-device by the user (verified.json on Linux, app storage on Android).",
+
+  "protocols": {
+    "googlecast": {
+      "label": "Google Cast",
+      "discovery": { "mdns": "_googlecast._tcp" },
+      "role": "stream",
+      "stream_potential": "likely",
+      "native_multiroom": "Cast speaker groups made in the Google Home app play in sync, including third-party speakers with Chromecast built-in (many Sony and Vizio soundbars).",
+      "sync_tier": 1,
+      "planned_version": "0.2",
+      "notes": "Receives audio by URL (an HTTP stream served by SpeakerBridge). Buffers several seconds, so it suits music; it is not suitable for lip-synced TV audio."
+    },
+    "airplay": {
+      "label": "AirPlay",
+      "discovery": { "mdns": "_airplay._tcp" },
+      "role": "stream",
+      "stream_potential": "likely",
+      "native_multiroom": "AirPlay 2 receivers can share a timeline when the sender supports AirPlay 2.",
+      "sync_tier": 1,
+      "planned_version": "0.6",
+      "notes": "Open-source senders exist (e.g. via PipeWire's RAOP module for AirPlay 1). AirPlay 2 sending from Linux is less mature."
+    },
+    "raop": {
+      "label": "AirPlay audio (RAOP)",
+      "discovery": { "mdns": "_raop._tcp" },
+      "role": "stream",
+      "stream_potential": "likely",
+      "native_multiroom": "",
+      "sync_tier": 2,
+      "planned_version": "0.2",
+      "notes": "PipeWire can stream to RAOP receivers directly with module-raop-discover, which makes this a strong early Linux target."
+    },
+    "dlna_renderer": {
+      "label": "DLNA / UPnP renderer",
+      "discovery": { "ssdp": "urn:schemas-upnp-org:device:MediaRenderer:1" },
+      "role": "stream",
+      "stream_potential": "likely",
+      "native_multiroom": "",
+      "sync_tier": 2,
+      "planned_version": "0.6",
+      "notes": "Plays a URL you hand it. No shared clock, so multi-speaker sync needs calibration and may drift."
+    },
+    "spotify_connect": {
+      "label": "Spotify Connect",
+      "discovery": { "mdns": "_spotify-connect._tcp" },
+      "role": "control",
+      "stream_potential": "none",
+      "native_multiroom": "",
+      "sync_tier": 3,
+      "planned_version": "",
+      "notes": "Only plays Spotify's own catalog. Cannot carry system audio from SpeakerBridge."
+    },
+    "sony_scalar": {
+      "label": "Sony Audio Control API",
+      "discovery": { "ssdp_text": "ScalarWebAPI" },
+      "role": "control",
+      "stream_potential": "none",
+      "native_multiroom": "",
+      "sync_tier": 3,
+      "planned_version": "0.6",
+      "notes": "Sony's local control API (volume, input, power). Useful for volume control; audio itself must arrive by Cast, AirPlay or DLNA."
+    },
+    "vizio_smartcast": {
+      "label": "Vizio SmartCast control",
+      "discovery": { "mdns": "_viziocast._tcp" },
+      "role": "control",
+      "stream_potential": "none",
+      "native_multiroom": "",
+      "sync_tier": 3,
+      "planned_version": "0.6",
+      "notes": "Vizio's local control interface. Audio for Vizio soundbars normally arrives via Chromecast built-in."
+    },
+    "sonos": {
+      "label": "Sonos",
+      "discovery": { "mdns": "_sonos._tcp" },
+      "role": "control",
+      "stream_potential": "limited",
+      "native_multiroom": "Sonos groups sync among Sonos speakers only.",
+      "sync_tier": 2,
+      "planned_version": "",
+      "notes": "Many Sonos speakers also expose AirPlay 2 or a UPnP renderer, which is the realistic path."
+    }
+  },
+
+  "brand_hints": [
+    { "brand": "Google",  "keywords": ["google", "nest", "chromecast"] },
+    { "brand": "Sony",    "keywords": ["sony", "bravia", "ht-a", "ht-s", "ht-g", "ht-z", "ht-x", "srs-"] },
+    { "brand": "Vizio",   "keywords": ["vizio", "smartcast"] },
+    { "brand": "Bose",    "keywords": ["bose"] },
+    { "brand": "Sonos",   "keywords": ["sonos"] },
+    { "brand": "LG",      "keywords": ["lg ", "lge", "webos"] },
+    { "brand": "Samsung", "keywords": ["samsung"] },
+    { "brand": "Denon",   "keywords": ["denon", "heos"] },
+    { "brand": "Yamaha",  "keywords": ["yamaha", "musiccast"] },
+    { "brand": "JBL",     "keywords": ["jbl", "harman"] },
+    { "brand": "Apple",   "keywords": ["apple", "homepod", "appletv", "audioaccessory"] },
+    { "brand": "Amazon",  "keywords": ["amazon", "echo"] }
+  ],
+
+  "not_speaker_hints": ["internetgatewaydevice", "wanconnection", "router", "printer", "mediaserver", "wfadevice", "dial:1"],
+
+  "status_labels": {
+    "verified":     "Verified: playback confirmed by you",
+    "ready_to_test":"Ready to test: has a streaming protocol SpeakerBridge will use",
+    "control_only": "Control only: found, but no protocol that accepts SpeakerBridge audio",
+    "group":        "Speaker group: a Cast group made in Google Home",
+    "not_speaker":  "Not a speaker (router, TV server, etc.)"
+  }
+}
