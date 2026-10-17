@@ -19,3 +19,11 @@ Follow these on every change in this repository (adapted from
 ## 4. Goal-driven execution
 - Turn each task into a goal you can check (for a bug: reproduce it first, ideally with a test, then fix it).
 - For multi-step work, give a short plan with how each step will be verified, and verify before calling it done.
+
+## 5. Legal first
+- Consider legality in every change. The owner must not be exposed to lawsuits.
+- Respect copyrights and trademarks: no copied characters, logos, brand names, art, code or data without a compatible licence; credit every third-party component on the licences page.
+- Keep the privacy policy, terms and disclaimers accurate whenever a feature changes what data is collected or where it goes. Anything that sends user data elsewhere stays optional and asks first.
+- Follow each outside service's terms (APIs, app stores, data sources). Don't scrape or bypass access controls.
+- No medical, financial or legal advice presented as professional advice; keep the "not professional advice" disclaimers.
+- When something is a legal grey area, stop and flag it instead of shipping it.
