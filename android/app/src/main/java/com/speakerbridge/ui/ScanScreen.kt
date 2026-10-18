@@ -63,6 +63,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.speakerbridge.model.Device
+import com.speakerbridge.playback.TestSound
 import com.speakerbridge.ui.theme.SB
 import com.speakerbridge.ui.theme.SBType
 
@@ -174,6 +175,9 @@ fun ScanScreen(vm: ScanViewModel) {
                 revision = state.revision,
                 statusLabel = vm.compat.statusLabels[d.status].orEmpty(),
                 onToggleVerified = { vm.toggleVerified(d) },
+                testMessage = state.testMessages[d.key],
+                testing = d.key in state.testing,
+                onPlayTest = { vm.playTestSound(d) },
             )
         }
     }
@@ -415,7 +419,15 @@ private fun Footer() {
 /* ------------------------------------------------------------- detail sheet */
 
 @Composable
-private fun DeviceSheet(d: Device, @Suppress("UNUSED_PARAMETER") revision: Int, statusLabel: String, onToggleVerified: () -> Unit) {
+private fun DeviceSheet(
+    d: Device,
+    @Suppress("UNUSED_PARAMETER") revision: Int,
+    statusLabel: String,
+    onToggleVerified: () -> Unit,
+    testMessage: String?,
+    testing: Boolean,
+    onPlayTest: () -> Unit,
+) {
     // Each block rises in just after the one above it, like the panels in the reference.
     Column(
         Modifier.fillMaxWidth().padding(horizontal = 18.dp).padding(bottom = 28.dp),
@@ -445,6 +457,25 @@ private fun DeviceSheet(d: Device, @Suppress("UNUSED_PARAMETER") revision: Int, 
             }
         }
         Field("Device key", d.key, Modifier.fillMaxWidth().reveal(420), mono = true)
+        if (d.status != "not_speaker" && TestSound.canPlay(d)) {
+            Spacer(Modifier.height(4.dp))
+            val src = remember { MutableInteractionSource() }
+            val pressed by src.collectIsPressedAsState()
+            val press by animateFloatAsState(if (pressed) 0.95f else 1f, tween(110), label = "test-press")
+            Box(
+                Modifier
+                    .reveal(445)
+                    .graphicsLayer { scaleX = press; scaleY = press }
+                    .border(1.dp, if (testing) SB.Line else SB.Cream, RoundedCornerShape(4.dp))
+                    .clickable(interactionSource = src, indication = null, enabled = !testing, onClick = onPlayTest)
+                    .padding(horizontal = 18.dp, vertical = 10.dp),
+            ) {
+                Text(if (testing) "Playing…" else "Play Test Sound", style = SBType.Button)
+            }
+            if (testMessage != null) {
+                Text(testMessage, style = SBType.BodySmall.copy(color = SB.Cream))
+            }
+        }
         if (d.status != "not_speaker") {
             Spacer(Modifier.height(4.dp))
             val verified = d.status == "verified"
@@ -463,7 +494,8 @@ private fun DeviceSheet(d: Device, @Suppress("UNUSED_PARAMETER") revision: Int, 
                 Text(if (verified) "Remove Verified Mark" else "I Heard It Play!", style = SBType.Button)
             }
             Text(
-                "Only tap this after you've actually heard SpeakerBridge audio on this speaker (streaming arrives in v0.2).",
+                if (TestSound.canPlay(d)) "Tap Play Test Sound first. Only mark it Verified once you've heard the chime on this speaker."
+                else "This speaker has no Cast or DLNA, so SpeakerBridge can't send it a test sound yet.",
                 style = SBType.BodySmall.copy(color = SB.Dim),
                 modifier = Modifier.reveal(520),
             )

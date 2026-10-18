@@ -74,8 +74,8 @@ class Compat(json: String) {
         dev.status = when {
             dev.key in verifiedKeys -> "verified"
             dev.isCastGroup -> {
-                notes += "This group already plays in sync across its members. SpeakerBridge can " +
-                    "target it as one speaker once Cast streaming lands (v0.2)."
+                notes += "This group already plays in sync across its members. Play Test Sound sends " +
+                    "the chime to the whole group at once."
                 "group"
             }
             streamers.isNotEmpty() -> "ready_to_test"

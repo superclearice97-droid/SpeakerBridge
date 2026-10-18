@@ -96,7 +96,7 @@ object Ssdp {
         }
     }
 
-    private fun isLan(host: String): Boolean = runCatching {
+    internal fun isLan(host: String): Boolean = runCatching {
         // Only accept numeric addresses so we never trigger a DNS lookup off the LAN.
         if (!host.all { it.isDigit() || it == '.' || it == ':' }) return false
         val a = InetAddress.getByName(host)

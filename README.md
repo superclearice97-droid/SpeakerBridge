@@ -4,6 +4,8 @@ Make Wi-Fi speakers from different brands (Sony, Vizio, Google Nest and others) 
 
 **Current version: 0.1 — discovery.** It finds the speakers on your network, shows which wireless audio protocols each one supports, and tells you honestly whether SpeakerBridge will be able to send audio to it. Streaming arrives in 0.2.
 
+**Test sound (Android):** tap a speaker, then **Play Test Sound**. The phone plays a short chime on it over Google Cast or DLNA (AirPlay not yet). On a Google Home speaker group, every member plays the chime together, in sync. Once you hear it, tap **I Heard It Play!** to mark the speaker Verified. The chime is generated on the phone and served only on your Wi-Fi; nothing leaves your network.
+
 ---
 
 ## Quick start
