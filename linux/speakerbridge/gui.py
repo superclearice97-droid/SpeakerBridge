@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import sys
+import threading
 
 try:
     from PySide6.QtCore import QObject, Qt, QThread, Signal
@@ -17,7 +18,7 @@ except ImportError:  # pragma: no cover
           "Or use the terminal scanner:  speakerbridge-scan", file=sys.stderr)
     raise SystemExit(1)
 
-from . import __version__, compat, scanner, store
+from . import __version__, compat, scanner, store, stream
 from .cli import STATUS_SHORT, _proto_labels
 
 STATUS_COLOR = {
@@ -43,6 +44,23 @@ class ScanWorker(QObject):
             self.finished.emit(scanner.scan(self.timeout))
         except Exception as exc:  # surface any network error in the UI
             self.failed.emit(f"{type(exc).__name__}: {exc}")
+
+
+class StreamWorker(QObject):
+    status = Signal(str)
+    done = Signal(str)
+
+    def __init__(self, host: str, port: int):
+        super().__init__()
+        self.host, self.port = host, port
+        self.stop = threading.Event()
+
+    def run(self) -> None:
+        try:
+            stream.run(self.host, self.port, self.stop, on_status=self.status.emit)
+            self.done.emit("Stream stopped. Audio is back on this computer.")
+        except Exception as exc:
+            self.done.emit(f"Couldn't stream: {exc}")
 
 
 class MainWindow(QMainWindow):
@@ -85,6 +103,13 @@ class MainWindow(QMainWindow):
         self.verify_btn.setToolTip("Use this only after you have heard audio play on this speaker.")
         self.verify_btn.clicked.connect(self.toggle_verified)
         self.verify_btn.setEnabled(False)
+        self.stream_btn = QPushButton("Stream this computer's audio here")
+        self.stream_btn.setToolTip("Sends everything this computer plays to the selected Cast speaker, "
+                                   "group or stereo pair. Stop to switch audio back.")
+        self.stream_btn.clicked.connect(self.toggle_stream)
+        self.stream_btn.setEnabled(False)
+        self.stream_thread: QThread | None = None
+        self.stream_worker: StreamWorker | None = None
 
         right = QWidget()
         rl = QVBoxLayout(right)
@@ -92,6 +117,7 @@ class MainWindow(QMainWindow):
         rl.addWidget(self.details)
         row = QHBoxLayout()
         row.addStretch(1)
+        row.addWidget(self.stream_btn)
         row.addWidget(self.verify_btn)
         rl.addLayout(row)
 
@@ -167,6 +193,7 @@ class MainWindow(QMainWindow):
                 self.table.setItem(r, c, item)
         self.details.clear()
         self.verify_btn.setEnabled(False)
+        self.stream_btn.setEnabled(self.stream_worker is not None)
 
     def selected(self):
         rows = self.table.selectionModel().selectedRows()
@@ -187,6 +214,7 @@ class MainWindow(QMainWindow):
         html.append("<p><small>Advertised: " + _esc(", ".join(sorted(d.raw_types)) or "-") + "</small></p>")
         self.details.setHtml("".join(html))
         self.verify_btn.setEnabled(d.status != "not_speaker")
+        self.stream_btn.setEnabled(self.stream_worker is not None or "googlecast" in d.protocols)
         self.verify_btn.setText("Remove verified mark" if d.status == "verified"
                                 else "Mark playback verified")
 
@@ -200,6 +228,43 @@ class MainWindow(QMainWindow):
             store.mark_verified(d.key, d.name, ",".join(d.protocols))
         compat.classify(d, store.verified_keys())
         self.refresh_table()
+
+    # ------------------------------------------------------------- streaming
+    def toggle_stream(self) -> None:
+        if self.stream_worker is not None:
+            self.stream_worker.stop.set()
+            self.stream_btn.setEnabled(False)
+            return
+        d = self.selected()
+        if d is None or "googlecast" not in d.protocols:
+            return
+        self.stream_thread = QThread(self)
+        self.stream_worker = StreamWorker(d.ip, d.protocols["googlecast"].port or 8009)
+        self.stream_worker.moveToThread(self.stream_thread)
+        self.stream_thread.started.connect(self.stream_worker.run)
+        self.stream_worker.status.connect(self.statusBar().showMessage)
+        self.stream_worker.done.connect(self.stream_done)
+        self.stream_btn.setText(f"Stop streaming to {d.name}")
+        self.stream_thread.start()
+
+    def stream_done(self, msg: str) -> None:
+        if self.stream_thread is not None:
+            self.stream_thread.quit()
+            self.stream_thread.wait()
+        self.stream_thread = self.stream_worker = None
+        self.stream_btn.setText("Stream this computer's audio here")
+        d = self.selected()
+        self.stream_btn.setEnabled(d is not None and "googlecast" in d.protocols)
+        self.statusBar().showMessage(msg)
+
+    def closeEvent(self, event) -> None:
+        # Always hand audio back to the computer's own speakers before quitting.
+        if self.stream_worker is not None:
+            self.stream_worker.stop.set()
+            if self.stream_thread is not None:
+                self.stream_thread.quit()
+                self.stream_thread.wait(5000)
+        super().closeEvent(event)
 
     def export_json(self) -> None:
         path, _ = QFileDialog.getSaveFileName(self, "Export scan", "speakerbridge-scan.json", "JSON (*.json)")

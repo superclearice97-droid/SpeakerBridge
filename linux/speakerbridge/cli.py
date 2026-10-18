@@ -83,5 +83,59 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
 
+def find_cast_target(devices, wanted: str):
+    """Picks a Cast device by key, exact name or a unique part of its name."""
+    casts = [d for d in devices if "googlecast" in d.protocols]
+    w = wanted.strip().lower()
+    for test in (lambda d: d.key.lower() == w, lambda d: d.name.lower() == w, lambda d: w in d.name.lower()):
+        hits = [d for d in casts if test(d)]
+        if len(hits) == 1:
+            return hits[0], casts
+        if len(hits) > 1:
+            return None, hits
+    return None, casts
+
+
+def stream_main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(
+        prog="speakerbridge-stream",
+        description="Send everything this computer plays to a Google Cast speaker, "
+                    "speaker group or stereo pair. Press Ctrl+C to stop and switch audio back.")
+    ap.add_argument("speaker", nargs="?", help="speaker name (or part of it) or device key")
+    ap.add_argument("--format", choices=["wav", "mp3"], default="wav",
+                    help="wav (default, lossless) or mp3 (needs ffmpeg; try it if wav won't play)")
+    ap.add_argument("--timeout", type=float, default=4.0, help="seconds to scan (default 4)")
+    args = ap.parse_args(argv)
+
+    import threading
+    from . import stream
+
+    devices = scanner.scan(args.timeout)
+    target, options = find_cast_target(devices, args.speaker or "") if args.speaker else (None, [
+        d for d in devices if "googlecast" in d.protocols])
+    if target is None:
+        if args.speaker and options and any(args.speaker.lower() in d.name.lower() for d in options):
+            print(f"More than one speaker matches '{args.speaker}'. Be more specific:", file=sys.stderr)
+        elif args.speaker:
+            print(f"No Cast speaker matches '{args.speaker}'.", file=sys.stderr)
+        print("Cast speakers found:" if options else "No Cast speakers found.", file=sys.stderr)
+        for d in options:
+            print(f"  {d.name}{'  (group)' if d.is_cast_group else ''}   key: {d.key}", file=sys.stderr)
+        return 1
+
+    port = target.protocols["googlecast"].port or 8009
+    print(f"Streaming to {target.name} ({target.ip}). Press Ctrl+C to stop.")
+    print("Note: Cast speakers buffer a second or two, so this suits music, not lip-synced video yet.")
+    stop = threading.Event()
+    try:
+        stream.run(target.ip, port, stop, fmt=args.format)
+    except KeyboardInterrupt:
+        print("\nStopping… audio is switching back to this computer.")
+    except stream.StreamError as exc:
+        print(f"Couldn't stream: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
 if __name__ == "__main__":
     sys.exit(main())

@@ -19,6 +19,15 @@ speakerbridge-scan               # same scan in the terminal
 speakerbridge-scan --json        # machine-readable output
 ```
 
+**Stream this computer's audio to a Cast speaker (new):**
+
+```bash
+speakerbridge-stream "Living Room"            # name, part of a name, or device key
+speakerbridge-stream "Living Room" --format mp3   # if a speaker won't play the default WAV stream (needs ffmpeg)
+```
+
+Or select the speaker in the desktop app and press **Stream this computer's audio here**. SpeakerBridge adds a virtual output called "SpeakerBridge", makes it the default, and moves what's already playing onto it, so everything the computer plays goes to the speaker. Stop (Ctrl+C or the button) and audio switches back to your usual output. Works with single speakers, Google Home speaker groups and stereo pairs. The stream stays on your local network. Cast speakers buffer a second or two, so for now this suits music rather than lip-synced video.
+
 Without installing, from the repo: `cd linux && python3 -m speakerbridge` (GUI) or `python3 -m speakerbridge scan`.
 
 The scanner itself uses only the Python standard library. The GUI needs `pyside6` (`sudo pacman -S pyside6`).
@@ -75,7 +84,7 @@ The scanner flags this when it sees a non-Google speaker with Cast ("can join a 
 | Version | Goal | Status |
 |---|---|---|
 | 0.1 | Discovery on Linux + Android, shared compatibility database | **Done** |
-| 0.2 | Linux → Google Cast (single speakers and Cast groups) via an HTTP stream of PipeWire audio; AirPlay (RAOP) via PipeWire's built-in module | Next |
+| 0.2 | Linux → Google Cast (single speakers and Cast groups) via an HTTP stream of PipeWire audio; AirPlay (RAOP) via PipeWire's built-in module | Cast streaming done; AirPlay next |
 | 0.3 | Multiple targets at once, saved groups, per-speaker volume | |
 | 0.4 | Sync engine: delay calibration for DLNA / mixed targets, drift monitoring | |
 | 0.5 | Android as an audio source (AudioPlaybackCapture, with your consent) | |

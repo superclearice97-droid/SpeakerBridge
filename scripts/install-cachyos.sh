@@ -10,14 +10,14 @@ BIN="$HOME/.local/bin"
 APPS="$HOME/.local/share/applications"
 
 if [[ "${1:-}" == "--uninstall" ]]; then
-  rm -rf "$DEST" "$BIN/speakerbridge" "$BIN/speakerbridge-scan" "$APPS/speakerbridge.desktop"
+  rm -rf "$DEST" "$BIN/speakerbridge" "$BIN/speakerbridge-scan" "$BIN/speakerbridge-stream" "$APPS/speakerbridge.desktop"
   echo "SpeakerBridge removed (your verified list in ~/.config/speakerbridge was kept)."
   exit 0
 fi
 
 echo "==> Installing system packages (python, pyside6, pipewire tools)"
 pkgs=()
-for p in python pyside6 pipewire pipewire-pulse; do
+for p in python pyside6 pipewire pipewire-pulse libpulse; do
   pacman -Qi "$p" &>/dev/null || pkgs+=("$p")
 done
 if ((${#pkgs[@]})); then
@@ -42,7 +42,11 @@ cat > "$BIN/speakerbridge-scan" <<EOF
 #!/usr/bin/env bash
 PYTHONPATH="$DEST" exec python3 -m speakerbridge.cli "\$@"
 EOF
-chmod +x "$BIN/speakerbridge" "$BIN/speakerbridge-scan"
+cat > "$BIN/speakerbridge-stream" <<EOF
+#!/usr/bin/env bash
+PYTHONPATH="$DEST" exec python3 -m speakerbridge stream "\$@"
+EOF
+chmod +x "$BIN/speakerbridge" "$BIN/speakerbridge-scan" "$BIN/speakerbridge-stream"
 
 cat > "$APPS/speakerbridge.desktop" <<EOF
 [Desktop Entry]
@@ -59,4 +63,5 @@ echo
 echo "Done. Open 'SpeakerBridge' from your app menu, or run:"
 echo "    speakerbridge          (desktop app)"
 echo "    speakerbridge-scan     (terminal scanner)"
+echo "    speakerbridge-stream \"Speaker name\"   (send this computer's audio to a Cast speaker)"
 case ":$PATH:" in *":$BIN:"*) ;; *) echo "Note: add $BIN to your PATH to use the commands above.";; esac
