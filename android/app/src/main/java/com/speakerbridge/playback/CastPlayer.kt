@@ -5,8 +5,10 @@ import java.io.ByteArrayOutputStream
 import java.io.DataInputStream
 import java.io.DataOutputStream
 import java.net.InetSocketAddress
-import java.net.SocketTimeoutException
+import java.io.IOException
 import java.security.cert.X509Certificate
+import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.TimeUnit
 import javax.net.ssl.SSLContext
 import javax.net.ssl.SSLSocket
 import javax.net.ssl.X509TrustManager
@@ -25,9 +27,18 @@ class CastPlayer(private val host: String, private val port: Int) {
     private lateinit var output: DataOutputStream
     private var requestId = 1
     private var lastPing = 0L
+    private val inbox = LinkedBlockingQueue<Msg>()
+    @Volatile private var readError: Throwable? = null
 
-    /** Blocking; call from Dispatchers.IO. Throws with a readable message if the speaker refuses. */
-    fun play(url: String, contentType: String, title: String, durationMs: Long, onStep: (String) -> Unit) {
+    /**
+     * Blocking; call from Dispatchers.IO. Throws with a readable message if the speaker refuses.
+     * The file is loaded paused, then held at [gate] until every speaker in the batch is
+     * ready, so they all get PLAY at the same moment.
+     */
+    fun play(
+        url: String, contentType: String, title: String, durationMs: Long,
+        onStep: (String) -> Unit, gate: StartGate.Party,
+    ) {
         open()
         var sessionId = ""
         try {
@@ -62,7 +73,37 @@ class CastPlayer(private val host: String, private val port: Int) {
                 .put("streamType", "BUFFERED")
                 .put("metadata", JSONObject().put("metadataType", 0).put("title", title))
             send(transportId, NS_MEDIA, JSONObject().put("type", "LOAD").put("requestId", requestId++)
-                .put("media", media).put("autoplay", true).toString())
+                .put("media", media).put("autoplay", false).toString())
+
+            var mediaSessionId = 0
+            var autoPlayed = false
+            val loaded = waitFor(15_000) { m ->
+                if (m.namespace != NS_MEDIA) return@waitFor false
+                val j = JSONObject(m.payload)
+                when (j.optString("type")) {
+                    "LOAD_FAILED", "LOAD_CANCELLED", "INVALID_REQUEST" ->
+                        error("the speaker couldn't load the test sound (${j.optString("type")})")
+                    "MEDIA_STATUS" -> {
+                        val st = j.optJSONArray("status")?.optJSONObject(0) ?: return@waitFor false
+                        mediaSessionId = st.optInt("mediaSessionId", mediaSessionId)
+                        when (st.optString("playerState")) {
+                            "PAUSED" -> true
+                            "PLAYING" -> { autoPlayed = true; true }   // receiver ignored autoplay=false
+                            else -> false
+                        }
+                    }
+                    else -> false
+                }
+            }
+            if (!loaded) error("the speaker didn't finish loading the test sound")
+            gate.arrive()
+            if (!gate.isOpen) onStep("Ready. Waiting for the other speakers…")
+            val gateDeadline = System.currentTimeMillis() + 20_000
+            while (!gate.isOpen && System.currentTimeMillis() < gateDeadline) waitFor(5) { false }   // keeps heartbeats going
+            if (!autoPlayed) {
+                send(transportId, NS_MEDIA, JSONObject().put("type", "PLAY").put("requestId", requestId++)
+                    .put("mediaSessionId", mediaSessionId).toString())
+            }
 
             var started = false
             val finished = waitFor(15_000 + durationMs) { m ->
@@ -110,9 +151,24 @@ class CastPlayer(private val host: String, private val port: Int) {
         sock.connect(InetSocketAddress(host, port), 4000)
         sock.soTimeout = 5000
         sock.startHandshake()
-        sock.soTimeout = 1000
+        sock.soTimeout = 0
         input = DataInputStream(sock.inputStream)
         output = DataOutputStream(sock.outputStream)
+        // A reader thread keeps whole frames flowing into [inbox], so waiting never splits a frame.
+        Thread {
+            try {
+                while (true) {
+                    val len = input.readInt()
+                    require(len in 0..(1 shl 20)) { "unexpected Cast frame size" }
+                    val buf = ByteArray(len)
+                    input.readFully(buf)
+                    inbox.put(decode(buf))
+                }
+            } catch (e: Throwable) {
+                readError = e
+                inbox.put(CLOSED)
+            }
+        }.apply { isDaemon = true }.start()
     }
 
     private fun send(dest: String, namespace: String, payload: String) {
@@ -125,26 +181,24 @@ class CastPlayer(private val host: String, private val port: Int) {
     /** Reads messages (answering heartbeats) until [match] returns true or time runs out. */
     private fun waitFor(timeoutMs: Long, match: (Msg) -> Boolean): Boolean {
         val deadline = System.currentTimeMillis() + timeoutMs
-        while (System.currentTimeMillis() < deadline) {
+        while (true) {
             val now = System.currentTimeMillis()
+            if (now >= deadline) return false
             if (now - lastPing > 5000) {
                 send(RECEIVER, NS_HEARTBEAT, """{"type":"PING"}""")
                 lastPing = now
             }
-            val len = try { input.readInt() } catch (_: SocketTimeoutException) { continue }
-            require(len in 0..(1 shl 20)) { "unexpected Cast frame size" }
-            val buf = ByteArray(len)
-            sock.soTimeout = 5000
-            input.readFully(buf)
-            sock.soTimeout = 1000
-            val m = decode(buf)
+            val m = inbox.poll(minOf(deadline - now, 1000L), TimeUnit.MILLISECONDS) ?: continue
+            if (m === CLOSED) {
+                inbox.put(CLOSED)
+                throw IOException("the speaker closed the connection", readError)
+            }
             if (m.namespace == NS_HEARTBEAT) {
                 if ("PING" in m.payload) send(m.source, NS_HEARTBEAT, """{"type":"PONG"}""")
                 continue
             }
             if (match(m)) return true
         }
-        return false
     }
 
     private object AcceptLanCert : X509TrustManager {
@@ -154,6 +208,7 @@ class CastPlayer(private val host: String, private val port: Int) {
     }
 
     companion object {
+        private val CLOSED = Msg("", "", "", "")
         const val APP_ID = "CC1AD845"   // Google's Default Media Receiver
         const val SENDER = "sender-0"
         const val RECEIVER = "receiver-0"

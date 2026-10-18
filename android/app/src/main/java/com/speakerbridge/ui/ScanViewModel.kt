@@ -29,6 +29,9 @@ data class UiState(
     val revision: Int = 0,   // bumps when a device changes in place (verified toggle)
     val testMessages: Map<String, String> = emptyMap(),   // device key -> latest test-sound status
     val testing: Set<String> = emptySet(),                // device keys with a test sound in progress
+    val together: Set<String> = emptySet(),               // device keys picked for Play Together
+    val togetherBusy: Boolean = false,
+    val togetherLines: List<String> = emptyList(),        // one status line per picked speaker
 ) {
     val visible: List<Device> get() = devices.filter { showAll || it.status != "not_speaker" }
 }
@@ -77,16 +80,46 @@ class ScanViewModel(app: Application) : AndroidViewModel(app) {
         if (key in _state.value.testing) return
         setTest(key, "Connecting…", busy = true)
         viewModelScope.launch(Dispatchers.IO) {
-            val msg = try {
-                TestSound.play(d) { step -> setTest(key, step, busy = true) }
-            } catch (e: java.net.ConnectException) {
-                "Couldn't reach the speaker. Check it's on and on the same Wi-Fi, then scan again."
-            } catch (e: Exception) {
-                "Couldn't play the test sound: ${e.message ?: e.javaClass.simpleName}"
-            }
+            val msg = runCatching { TestSound.play(d) { step -> setTest(key, step, busy = true) } }
+                .getOrElse { failure(it) }
             setTest(key, msg, busy = false)
         }
     }
+
+    fun toggleTogether(d: Device) = _state.update {
+        it.copy(together = if (d.key in it.together) it.together - d.key else it.together + d.key)
+    }
+
+    /** Plays the chime on every picked speaker, started at the same moment. */
+    fun playTogether() {
+        val s = _state.value
+        val picked = s.visible.filter { it.key in s.together && TestSound.canPlay(it) }
+        if (s.togetherBusy || picked.size < 2) return
+        val lines = picked.associate { it.key to "${it.name}: connecting…" }.toMutableMap()
+        fun show(busy: Boolean) = _state.update { st ->
+            st.copy(togetherBusy = busy, togetherLines = synchronized(lines) { picked.map { lines.getValue(it.key) } })
+        }
+        show(true)
+        viewModelScope.launch(Dispatchers.IO) {
+            val results = runCatching {
+                TestSound.playMany(picked) { d, step ->
+                    synchronized(lines) { lines[d.key] = "${d.name}: $step" }
+                    show(true)
+                }
+            }
+            synchronized(lines) {
+                for (d in picked) {
+                    val r: Result<String> = results.fold({ it.getValue(d) }, { e -> Result.failure(e) })
+                    lines[d.key] = "${d.name}: " + r.fold({ "played" }, { failure(it) })
+                }
+            }
+            show(false)
+        }
+    }
+
+    private fun failure(e: Throwable): String =
+        if (e is java.net.ConnectException) "Couldn't reach the speaker. Check it's on and on the same Wi-Fi, then scan again."
+        else "Couldn't play the test sound: ${e.message ?: e.javaClass.simpleName}"
 
     private fun setTest(key: String, msg: String, busy: Boolean) = _state.update {
         it.copy(testMessages = it.testMessages + (key to msg), testing = if (busy) it.testing + key else it.testing - key)

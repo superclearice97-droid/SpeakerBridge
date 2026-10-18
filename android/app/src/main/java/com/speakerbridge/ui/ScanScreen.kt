@@ -140,6 +140,13 @@ fun ScanScreen(vm: ScanViewModel) {
                 Hero(state, speakers, usable)
                 Hairline()
             }
+            val playable = visible.filter { it.status != "not_speaker" && TestSound.canPlay(it) }
+            if (playable.size >= 2) {
+                item(key = "together") {
+                    PlayTogether(state, playable, vm::toggleTogether, vm::playTogether)
+                    Hairline()
+                }
+            }
             for (status in SECTION_ORDER) {
                 val group = visible.filter { it.status == status }
                 if (group.isEmpty()) continue
@@ -307,6 +314,59 @@ private fun Hero(state: UiState, speakers: Int, usable: Int) {
                 Hairline()
             }
         }
+    }
+}
+
+/* --------------------------------------------------------- play together */
+
+@Composable
+private fun PlayTogether(state: UiState, playable: List<Device>, onToggle: (Device) -> Unit, onPlay: () -> Unit) {
+    val picked = playable.count { it.key in state.together }
+    Column(Modifier.padding(horizontal = 18.dp, vertical = 18.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+        Text("PLAY TOGETHER", style = SBType.MonoLabel)
+        Text("Pick two or more speakers and SpeakerBridge starts the chime on all of them at the same moment.",
+            style = SBType.BodySmall)
+        for (d in playable) {
+            val on = d.key in state.together
+            Row(
+                Modifier.fillMaxWidth().clickable(enabled = !state.togetherBusy) { onToggle(d) }.padding(vertical = 6.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Box(
+                    Modifier.size(16.dp).border(1.dp, if (on) SB.Red else SB.Line, RoundedCornerShape(3.dp))
+                        .padding(3.dp).background(if (on) SB.Red else Color.Transparent, RoundedCornerShape(1.dp)),
+                )
+                Spacer(Modifier.width(12.dp))
+                Text(d.name.ifEmpty { "(unnamed)" }, style = SBType.Body, modifier = Modifier.weight(1f),
+                    maxLines = 1, overflow = TextOverflow.Ellipsis)
+                Text(if (d.isCastGroup) "GROUP" else d.protocols.keys.joinToString(" · ") { shortProto(it) }.uppercase(),
+                    style = SBType.Mono.copy(color = SB.Dim), maxLines = 1)
+            }
+        }
+        val ready = picked >= 2 && !state.togetherBusy
+        Box(
+            Modifier
+                .background(if (ready) SB.Red else Color.Transparent, RoundedCornerShape(4.dp))
+                .border(1.dp, if (ready) SB.Red else SB.Line, RoundedCornerShape(4.dp))
+                .clickable(enabled = ready, onClick = onPlay)
+                .padding(horizontal = 18.dp, vertical = 10.dp),
+        ) {
+            Text(
+                when {
+                    state.togetherBusy -> "Playing…"
+                    picked < 2 -> "Pick at least two"
+                    else -> "Play Together ($picked)"
+                },
+                style = SBType.Button,
+            )
+        }
+        state.togetherLines.forEach { Text(it, style = SBType.BodySmall.copy(color = SB.Cream)) }
+        Text(
+            "Speakers of different brands can still land a fraction of a second apart. For Google Cast " +
+                "speakers, a speaker group made in the Google Home app keeps them perfectly in sync; it then " +
+                "shows up here as one speaker.",
+            style = SBType.BodySmall.copy(color = SB.Dim),
+        )
     }
 }
 

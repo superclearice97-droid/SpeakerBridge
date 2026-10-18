@@ -9,8 +9,11 @@ import java.net.URL
 /** Plays one URL on a DLNA / UPnP renderer with the standard AVTransport actions. */
 object DlnaPlayer {
 
-    /** Blocking; call from Dispatchers.IO. [location] is the renderer's description URL from SSDP. */
-    fun play(location: String, url: String, contentType: String, title: String) {
+    /**
+     * Blocking; call from Dispatchers.IO. [location] is the renderer's description URL from SSDP.
+     * The URL is set first, then held at [gate] so every speaker in the batch gets Play together.
+     */
+    fun play(location: String, url: String, contentType: String, title: String, gate: StartGate.Party) {
         val loc = URL(location)
         require(Ssdp.isLan(loc.host)) { "the speaker's address is not on your local network" }
         val (serviceType, control, base) = avTransport(get(loc))
@@ -27,6 +30,9 @@ object DlnaPlayer {
         runCatching { soap(controlUrl, serviceType, "Stop", "") }   // some renderers need an idle transport first
         soap(controlUrl, serviceType, "SetAVTransportURI",
             "<CurrentURI>${esc(url)}</CurrentURI><CurrentURIMetaData>${esc(didl)}</CurrentURIMetaData>")
+        gate.arrive()
+        val deadline = System.currentTimeMillis() + 20_000
+        while (!gate.isOpen && System.currentTimeMillis() < deadline) Thread.sleep(2)
         soap(controlUrl, serviceType, "Play", "<Speed>1</Speed>")
     }
 
