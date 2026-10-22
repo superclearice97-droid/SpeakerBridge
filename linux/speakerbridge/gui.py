@@ -18,7 +18,7 @@ except ImportError:  # pragma: no cover
           "Or use the terminal scanner:  speakerbridge-scan", file=sys.stderr)
     raise SystemExit(1)
 
-from . import __version__, compat, scanner, store, stream
+from . import __version__, compat, mic, scanner, store, stream
 from .cli import STATUS_SHORT, _proto_labels
 
 STATUS_COLOR = {
@@ -63,6 +63,23 @@ class StreamWorker(QObject):
                            + (f" Not played on: {'; '.join(failures)}" if failures else ""))
         except Exception as exc:
             self.done.emit(f"Couldn't stream: {exc}")
+
+
+class MicWorker(QObject):
+    status = Signal(str)
+    done = Signal(dict, list, str)   # delays, problems, error
+
+    def __init__(self, targets: list):
+        super().__init__()
+        self.targets = targets
+        self.cancel = threading.Event()
+
+    def run(self) -> None:
+        try:
+            delays, problems = mic.calibrate(self.targets, on_status=self.status.emit, cancel=self.cancel)
+            self.done.emit(delays, problems, "")
+        except Exception as exc:   # MicError, or anything unexpected: report it, never hang
+            self.done.emit({}, [], str(exc))
 
 
 class MainWindow(QMainWindow):
@@ -126,6 +143,14 @@ class MainWindow(QMainWindow):
                                   "changes apply straight away while streaming.")
         self.delay_box.setEnabled(False)
         self.delay_box.valueChanged.connect(self.delay_changed)
+        self.mic_btn = QPushButton("Line up with microphone…")
+        self.mic_btn.setToolTip("Select two or more speakers. Each plays clicks while this computer's "
+                                "microphone listens, and their sync delays are set for you. Asks first; "
+                                "the recording is never saved or sent anywhere.")
+        self.mic_btn.clicked.connect(self.toggle_mic)
+        self.mic_btn.setEnabled(False)
+        self.mic_thread: QThread | None = None
+        self.mic_worker: MicWorker | None = None
 
         right = QWidget()
         rl = QVBoxLayout(right)
@@ -133,6 +158,7 @@ class MainWindow(QMainWindow):
         rl.addWidget(self.details)
         row = QHBoxLayout()
         row.addStretch(1)
+        row.addWidget(self.mic_btn)
         row.addWidget(self.delay_box)
         row.addWidget(self.clicks_box)
         row.addWidget(self.stream_btn)
@@ -230,9 +256,14 @@ class MainWindow(QMainWindow):
     def streamable_selection(self) -> list:
         return [t for t in (stream.target_for(d) for d in self.selected_all()) if t]
 
+    def _update_lineup_buttons(self) -> None:
+        sel = self.streamable_selection()
+        self.stream_btn.setEnabled(self.stream_worker is not None or (self.mic_worker is None and bool(sel)))
+        self.mic_btn.setEnabled(self.mic_worker is not None or (self.stream_worker is None and len(sel) >= 2))
+
     def show_details(self) -> None:
         d = self.selected()
-        self.stream_btn.setEnabled(self.stream_worker is not None or bool(self.streamable_selection()))
+        self._update_lineup_buttons()
         self.delay_box.blockSignals(True)
         self.delay_box.setValue(store.delays().get(d.key, 0) if d else 0)
         self.delay_box.blockSignals(False)
@@ -292,6 +323,7 @@ class MainWindow(QMainWindow):
         self.stream_worker.done.connect(self.stream_done)
         self.stream_btn.setText(f"Stop streaming to {', '.join(t.name for t in targets)}")
         self.clicks_box.setEnabled(False)
+        self.mic_btn.setEnabled(False)
         self.stream_thread.start()
 
     def stream_done(self, msg: str) -> None:
@@ -301,11 +333,63 @@ class MainWindow(QMainWindow):
         self.stream_thread = self.stream_worker = None
         self.stream_btn.setText("Stream this computer's audio here")
         self.clicks_box.setEnabled(True)
-        self.stream_btn.setEnabled(bool(self.streamable_selection()))
+        self._update_lineup_buttons()
         self.statusBar().showMessage(msg)
 
+    # ------------------------------------------------------------- microphone calibration
+    def toggle_mic(self) -> None:
+        if self.mic_worker is not None:
+            self.mic_worker.cancel.set()
+            self.mic_btn.setEnabled(False)
+            return
+        targets = self.streamable_selection()
+        if len(targets) < 2 or self.stream_worker is not None:
+            return
+        yes = QMessageBox.StandardButton.Yes
+        if QMessageBox.question(self, "Use the microphone?", mic.CONSENT + "\n\nUse the microphone now?",
+                                yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.No) != yes:
+            return
+        self.mic_thread = QThread(self)
+        self.mic_worker = MicWorker(targets)
+        self.mic_worker.moveToThread(self.mic_thread)
+        self.mic_thread.started.connect(self.mic_worker.run)
+        self.mic_worker.status.connect(self.statusBar().showMessage)
+        self.mic_worker.done.connect(self.mic_done)
+        self.mic_btn.setText("Stop listening")
+        self.stream_btn.setEnabled(False)
+        self.mic_thread.start()
+
+    def mic_done(self, delays: dict, problems: list, error: str) -> None:
+        names = {t.key: t.name for t in self.mic_worker.targets} if self.mic_worker else {}
+        if self.mic_thread is not None:
+            self.mic_thread.quit()
+            self.mic_thread.wait()
+        self.mic_thread = self.mic_worker = None
+        self.mic_btn.setText("Line up with microphone…")
+        if error == "stopped":
+            msg = "Stopped. Delays not changed."
+        elif error:
+            msg = f"Couldn't line the speakers up: {error}."
+        elif len(delays) < 2:
+            msg = "Couldn't measure enough speakers to line them up. Delays not changed."
+        else:
+            for key, ms in delays.items():
+                store.save_delay(key, ms)
+            msg = "Lined up and saved: " + ", ".join(f"{names.get(k, k)} {ms} ms" for k, ms in delays.items()) + "."
+        if problems:
+            msg += "\n\nNot measured:\n" + "\n".join(problems)
+        self.statusBar().showMessage(msg.split("\n")[0])
+        self.show_details()
+        if self.isVisible():
+            QMessageBox.information(self, "Microphone calibration", msg)
+
     def closeEvent(self, event) -> None:
-        # Always hand audio back to the computer's own speakers before quitting.
+        # Always hand audio back to the computer's own speakers, and stop listening, before quitting.
+        if self.mic_worker is not None:
+            self.mic_worker.cancel.set()
+            if self.mic_thread is not None:
+                self.mic_thread.quit()
+                self.mic_thread.wait(5000)
         if self.stream_worker is not None:
             self.stream_worker.stop.set()
             if self.stream_thread is not None:

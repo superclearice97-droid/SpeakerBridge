@@ -23,7 +23,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "linux"))
 
-from speakerbridge import cast, cli, dlna, drift, store, stream  # noqa: E402
+from speakerbridge import cast, cli, dlna, drift, mic, store, stream  # noqa: E402
 from speakerbridge.model import Device, ProtocolHit  # noqa: E402
 
 
@@ -115,6 +115,25 @@ class LiveServerTest(unittest.TestCase):
                 self.assertEqual(len(r.read(44 + stream.CHUNK)), 44 + stream.CHUNK)
         finally:
             srv.close()
+
+    def test_closing_ends_open_streams_and_stops_an_endless_source(self):
+        pulled = []
+
+        def endless():
+            while True:
+                pulled.append(1)
+                yield bytes(stream.CHUNK)
+                time.sleep(0.02)
+        srv = stream.LiveServer(endless(), "127.0.0.1")
+        r = OPEN(srv.url_for(0), timeout=5)
+        r.read(44 + stream.CHUNK)
+        srv.close()
+        t0 = time.monotonic()
+        while r.read(stream.CHUNK):   # a speaker that ignored Stop still gets cut off
+            self.assertLess(time.monotonic() - t0, 2)
+        n = len(pulled)
+        time.sleep(0.2)
+        self.assertLessEqual(len(pulled) - n, 1)   # and nothing keeps pulling the clicks
 
     def test_delay_holds_audio_back_from_the_start(self):
         delays = {0: 0, 1: 300}
@@ -547,6 +566,101 @@ class DriftTests(unittest.TestCase):
         self.assertIn("jumped", said[-1])
 
 
+# ------------------------------------------------------------ microphone calibration
+def mono_click():
+    from array import array
+    a = array("h", stream.click_chunk())
+    return a[::2]   # left channel
+
+
+def room_recording(seconds, clicks, rate=mic.MIC_RATE, seed=5):
+    """Hiss plus each (time, gain) click, with a quieter echo 37 ms later."""
+    import random as rnd
+    from array import array
+    rng = rnd.Random(seed)
+    out = array("h", (rng.randint(-60, 60) for _ in range(int(seconds * rate))))
+    click = mono_click()
+    for t, gain in clicks:
+        for when, g in ((t, gain), (t + 0.037, gain * 0.4)):
+            i = int(when * rate)
+            for k, x in enumerate(click):
+                if 0 <= i + k < len(out):
+                    out[i + k] = max(-32768, min(32767, out[i + k] + int(x * g)))
+    return out
+
+
+class FakeMic:
+    """Stands in for MicRecorder: 'hears' the FakePlayers' clicks (loud and quiet ones), plus
+    hiss and echoes, through a microphone that adds its own fixed lag."""
+    LAG = 0.023
+
+    def __init__(self, players_and_gains):
+        self.players = players_and_gains
+        self.cleared = 0
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        pass
+
+    def between(self, t_from, t_to):
+        events = [(h - t_from + self.LAG, g) for pl, g in self.players for h in pl.heard if t_from <= h <= t_to]
+        return room_recording(t_to - t_from, events), t_from
+
+    def clear(self):
+        self.cleared += 1
+
+
+class MicTests(unittest.TestCase):
+    def test_hears_loud_and_quiet_clicks_to_a_millisecond_despite_echoes(self):
+        truth = [0.5, 1.37, 2.03, 3.11, 4.4]
+        rec = room_recording(5, [(t, 1.0 if i % 2 else 0.05) for i, t in enumerate(truth)])
+        found = mic.onsets(rec, mic.MIC_RATE, 100.0)
+        self.assertEqual(len(found), len(truth), found)
+        for f, t in zip(found, truth):
+            self.assertAlmostEqual(f - 100.0, t, delta=0.0015)
+
+    def test_hiss_alone_is_not_a_click(self):
+        self.assertEqual(mic.onsets(room_recording(3, []), mic.MIC_RATE, 0.0), [])
+
+    def _sent(self, n=16):
+        t, out = 10.0, []
+        for k in range(n):
+            out.append(t)
+            t += mic.GAPS_S[k % len(mic.GAPS_S)]
+        return out
+
+    def test_pattern_match_survives_missed_and_stray_clicks(self):
+        import random as rnd
+        rng = rnd.Random(2)
+        sent = self._sent()
+        heard = [s + 1.234 + rng.uniform(-0.002, 0.002) for i, s in enumerate(sent) if i % 3]   # a third missed
+        heard += [sent[0] + rng.uniform(0, 12) for _ in range(6)]                               # door slams
+        self.assertAlmostEqual(mic.match(sent, sorted(heard)), 1.234, delta=0.003)
+
+    def test_no_match_without_the_pattern(self):
+        sent = self._sent()
+        heard = [sent[0] + 0.5 + k * 0.7 for k in range(12)]   # evenly spaced: not our pattern
+        self.assertIsNone(mic.match(sent, heard))
+
+    def test_needs_a_yes_before_using_the_microphone(self):
+        ts = [stream.Target("A", "googlecast", "127.0.0.1"), stream.Target("B", "googlecast", "127.0.0.1")]
+        used = []
+
+        class Spy(FakeMic):
+            def __enter__(self):
+                used.append(1)
+                return self
+        for reply in ("", "n", "no thanks"):
+            self.assertEqual(cli.auto_calibrate(ts, answer=lambda _: reply, recorder=Spy([])), 1)
+
+        def eof(_):
+            raise EOFError
+        self.assertEqual(cli.auto_calibrate(ts, answer=eof, recorder=Spy([])), 1)
+        self.assertEqual(used, [])
+
+
 @unittest.skipUnless(shutil.which("openssl"), "needs openssl to make a test certificate")
 class StreamEndToEnd(unittest.TestCase):
     @classmethod
@@ -705,6 +819,47 @@ esac
         self.assertTrue(any("doesn't report how far" in s for s in statuses), statuses)
         polls = fake.actions.count("GetPositionInfo")
         self.assertLess(polls, 20)   # it stops asking
+
+    def test_microphone_calibration_lines_mixed_speakers_up(self):
+        from unittest import mock
+        old = os.environ.get("XDG_CONFIG_HOME")
+        os.environ["XDG_CONFIG_HOME"] = tempfile.mkdtemp()
+        quick = dict(GAPS_S=(0.30, 0.50, 0.40, 0.62, 0.36, 0.54), MAX_LATENCY_S=1.5, LISTEN_S=4.5)
+        nest_pl, heos_pl = FakePlayer(buffer_s=0.3), FakePlayer(buffer_s=1.0)
+        try:
+            nest_fake, heos_fake = FakeCast(self.tmp, nest_pl), FakeDlna(player=heos_pl)
+            nest_fake.start()
+            nest = stream.Target("Kitchen Nest", "googlecast", "127.0.0.1", port=nest_fake.port, key="cast:n")
+            heos = heos_fake.target()
+            heos.key = "dlna:h"
+            room = FakeMic([(nest_pl, 0.8), (heos_pl, 0.1)])   # one loud and near, one quiet and far
+            with mock.patch.multiple(mic, **quick):
+                rc = cli.auto_calibrate([nest, heos], answer=lambda _: "y", recorder=room)
+            self.assertEqual(rc, 0)
+            saved = store.delays()
+            heos_fake.close()
+        finally:
+            if old is None:
+                del os.environ["XDG_CONFIG_HOME"]
+            else:
+                os.environ["XDG_CONFIG_HOME"] = old
+        self.assertNotIn("dlna:h", saved)                      # the slowest stays at 0
+        self.assertAlmostEqual(saved["cast:n"], 700, delta=25)  # 1.0 s vs 0.3 s of buffering
+        self.assertEqual(room.cleared, 2)                      # recording cleared after each speaker
+
+        # And with those delays, the two really do play together.
+        p1, p2 = FakePlayer(buffer_s=0.3), FakePlayer(buffer_s=1.0)
+        f1, f2 = FakeCast(self.tmp, p1), FakeDlna(player=p2)
+        f1.start()
+        t1 = stream.Target("Kitchen Nest", "googlecast", "127.0.0.1", port=f1.port, delay_ms=saved["cast:n"])
+        try:
+            self._run([t1, f2.target()], stream.clicks(), seconds=4)
+        finally:
+            f2.close()
+        pairs = [(a, b) for a in p1.heard for b in p2.heard if abs(a - b) < 0.5]
+        self.assertGreaterEqual(len(pairs), 2)
+        for a, b in pairs:
+            self.assertLess(abs(a - b), 0.03)   # within 30 ms (uncalibrated: 700 ms apart)
 
     def test_one_speaker_failing_does_not_stop_the_others(self):
         cast_fake, bad = FakeCast(self.tmp), FakeDlna(reject="SetAVTransportURI")

@@ -110,9 +110,13 @@ def stream_main(argv: list[str] | None = None) -> int:
     ap.add_argument("--format", choices=["wav", "mp3"], default="wav",
                     help="wav (default, lossless) or mp3 (needs ffmpeg; try it if wav won't play)")
     ap.add_argument("--timeout", type=float, default=4.0, help="seconds to scan (default 4)")
-    ap.add_argument("--calibrate", action="store_true",
-                    help="play clicks on the speakers and line them up by ear; the delays are saved "
-                         "and used every time you stream to them")
+    lineup = ap.add_mutually_exclusive_group()
+    lineup.add_argument("--calibrate", action="store_true",
+                        help="play clicks on the speakers and line them up by ear; the delays are saved "
+                             "and used every time you stream to them")
+    lineup.add_argument("--auto-calibrate", action="store_true",
+                        help="line the speakers up automatically using this computer's microphone "
+                             "(asks first; the recording is never saved or sent anywhere)")
     args = ap.parse_args(argv)
 
     import threading
@@ -141,6 +145,8 @@ def stream_main(argv: list[str] | None = None) -> int:
         t.delay_ms = saved.get(t.key, 0)
     if args.calibrate:
         return calibrate(targets)
+    if args.auto_calibrate:
+        return auto_calibrate(targets)
 
     names = ", ".join(f"{t.name} ({t.host}{f', sync delay {t.delay_ms} ms' if t.delay_ms else ''})"
                       for t in targets)
@@ -225,6 +231,46 @@ def calibrate(targets) -> int:
         store.save_delay(t.key, t.delay_ms)
     print("Saved. These delays are used every time you stream to these speakers:")
     print(delays_text(targets))
+    return 0
+
+
+def auto_calibrate(targets, answer=input, recorder=None) -> int:
+    """Lines the speakers up with the microphone, after asking."""
+    from . import mic
+    if len(targets) < 2:
+        print("Calibration lines speakers up with each other: name at least two.", file=sys.stderr)
+        return 1
+    print(mic.CONSENT)
+    try:
+        ok = answer("\nUse the microphone now? [y/N] ").strip().lower() in ("y", "yes")
+    except EOFError:
+        ok = False
+    if not ok:
+        print("Not using the microphone. To line them up by ear instead: speakerbridge-stream --calibrate …")
+        return 1
+    try:
+        delays, problems = mic.calibrate(targets, on_status=lambda m: print(f"  {m}"), recorder=recorder)
+    except mic.MicError as exc:
+        print(f"Couldn't use the microphone: {exc}.", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        print("\nStopped. Delays not changed.")
+        return 1
+    if len(delays) < 2:
+        print("Couldn't measure enough speakers to line them up. Delays not changed.", file=sys.stderr)
+        for line in problems:
+            print(f"  {line}", file=sys.stderr)
+        return 1
+    measured = [t for t in targets if t.key in delays]
+    for t in measured:
+        t.delay_ms = delays[t.key]
+        store.save_delay(t.key, t.delay_ms)
+    print("Saved. These delays are used every time you stream to these speakers:")
+    print(delays_text(measured))
+    if problems:
+        print("Not measured (their delays are unchanged):")
+        for line in problems:
+            print(f"  {line}")
     return 0
 
 

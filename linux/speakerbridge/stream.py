@@ -74,13 +74,21 @@ def wav_header(rate: int = RATE, channels: int = CHANNELS) -> bytes:
             b"data" + struct.pack("<I", 0xFFFFFFFF))
 
 
+CLICK_HZ = 1500
+
+
+def click_chunk() -> bytes:
+    """20 ms of audio starting with a 10 ms, 1.5 kHz click that fades out."""
+    click = bytearray()
+    for i in range(RATE // 100):
+        v = int(20000 * math.sin(2 * math.pi * CLICK_HZ * i / RATE) * (1 - i / (RATE // 100)))
+        click += struct.pack("<hh", v, v)
+    return bytes(click) + bytes(CHUNK - len(click))
+
+
 def clicks() -> Iterator[bytes]:
     """A short click once a second, paced in real time, for lining speakers up by ear."""
-    click = bytearray()
-    for i in range(RATE // 100):   # 10 ms, 1.5 kHz, fading out
-        v = int(20000 * math.sin(2 * math.pi * 1500 * i / RATE) * (1 - i / (RATE // 100)))
-        click += struct.pack("<hh", v, v)
-    period = [bytes(click) + bytes(CHUNK - len(click))] + [bytes(CHUNK)] * 49
+    period = [click_chunk()] + [bytes(CHUNK)] * 49
     start, n = time.monotonic(), 0
     while True:
         yield period[n % 50]
@@ -264,6 +272,7 @@ class LiveServer:
         self._listeners: list[queue.Queue] = []
         self._lock = threading.Lock()
         self.timelines: dict[int, Timeline] = {}   # latest connection of each speaker
+        self._closed = False
         server = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -363,6 +372,8 @@ class LiveServer:
 
     def _pump(self, source: Iterable[bytes]) -> None:
         for b in source:
+            if self._closed:   # an endless source (clicks) would otherwise run on forever
+                break
             item = (time.monotonic(), b)
             with self._lock:
                 for q in list(self._listeners):
@@ -380,8 +391,17 @@ class LiveServer:
                 q.put(None)
 
     def close(self) -> None:
+        """Stops serving, and ends every open stream (a speaker that ignored Stop included)."""
+        self._closed = True
         self.httpd.shutdown()
         self.httpd.server_close()
+        with self._lock:
+            for q in self._listeners:
+                try:
+                    q.get_nowait()   # make room if it's full
+                except queue.Empty:
+                    pass
+                q.put_nowait(None)
 
 
 # ------------------------------------------------------------ putting it together
@@ -398,13 +418,15 @@ class _Link:
     say: Callable[[str], None]
     heard: str                              # extra words for the "Streaming." message
     monitor: drift.DriftMonitor | None      # None for MP3, which can't take corrections
+    playing: Callable[[], None]             # call once the speaker has started playing
 
 
 def run(targets: list[Target], stop: threading.Event, source: Iterable[bytes] | None = None,
-        fmt: str = "wav", on_status=print) -> list[str]:
+        fmt: str = "wav", on_status=print, on_playing: Callable[[Target], None] = lambda t: None) -> list[str]:
     """Streams to every target at once until `stop` is set or every speaker has stopped.
     Blocking. A speaker that fails doesn't stop the others; returns their error messages
-    (raises StreamError if none could play). `source` replaces the PipeWire capture (tests)."""
+    (raises StreamError if none could play). `source` replaces the PipeWire capture (sync
+    clicks, microphone calibration, tests). on_playing(target) is called as each one starts."""
     if not targets:
         raise StreamError("no speakers to stream to")
     bind_ip = local_ip_for(targets[0].host)
@@ -426,7 +448,8 @@ def run(targets: list[Target], stop: threading.Event, source: Iterable[bytes] | 
                 say_t = lambda m: say(t, m)   # noqa: E731
                 monitor = (drift.DriftMonitor(lambda: server.timeline(n), say_t, BYTES_PER_MS * 1000)
                            if fmt == "wav" else None)
-                link = _Link(t, server.url_for(n), server.content_type, stop, say_t, heard, monitor)
+                link = _Link(t, server.url_for(n), server.content_type, stop, say_t, heard, monitor,
+                             lambda: on_playing(t))
                 (_play_cast if t.protocol == "googlecast" else _play_dlna)(link)
             except (StreamError, CastError, DlnaError, OSError) as exc:
                 if len(targets) == 1:
@@ -463,6 +486,7 @@ def _play_cast(link: _Link) -> None:
         session.launch()
         session.load(link.url, link.content_type, TITLE, stream_type="LIVE", autoplay=True)
         say("Streaming." + link.heard)
+        link.playing()
 
         def ended(ns, p):
             if ns == NS_RECEIVER and p.get("type") == "RECEIVER_STATUS":
@@ -497,6 +521,7 @@ def _play_dlna(link: _Link) -> None:
     try:
         renderer.play(link.url, link.content_type, TITLE)
         say("Streaming over DLNA." + link.heard)
+        link.playing()
         started, answered = time.monotonic(), False
         while not link.stop.wait(random.uniform(*drift.DLNA_POLL_S) if mon and mon.enabled else None):
             t0 = time.monotonic()
