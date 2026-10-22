@@ -63,5 +63,5 @@ echo
 echo "Done. Open 'SpeakerBridge' from your app menu, or run:"
 echo "    speakerbridge          (desktop app)"
 echo "    speakerbridge-scan     (terminal scanner)"
-echo "    speakerbridge-stream \"Speaker name\"   (send this computer's audio to a Cast speaker)"
+echo "    speakerbridge-stream \"Speaker name\" [\"Another speaker\" ...]   (send this computer's audio to Cast and DLNA speakers)"
 case ":$PATH:" in *":$BIN:"*) ;; *) echo "Note: add $BIN to your PATH to use the commands above.";; esac

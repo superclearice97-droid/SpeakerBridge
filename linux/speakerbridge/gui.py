@@ -50,15 +50,16 @@ class StreamWorker(QObject):
     status = Signal(str)
     done = Signal(str)
 
-    def __init__(self, host: str, port: int):
+    def __init__(self, targets: list):
         super().__init__()
-        self.host, self.port = host, port
+        self.targets = targets
         self.stop = threading.Event()
 
     def run(self) -> None:
         try:
-            stream.run(self.host, self.port, self.stop, on_status=self.status.emit)
-            self.done.emit("Stream stopped. Audio is back on this computer.")
+            failures = stream.run(self.targets, self.stop, on_status=self.status.emit)
+            self.done.emit("Stream stopped. Audio is back on this computer."
+                           + (f" Not played on: {'; '.join(failures)}" if failures else ""))
         except Exception as exc:
             self.done.emit(f"Couldn't stream: {exc}")
 
@@ -89,7 +90,7 @@ class MainWindow(QMainWindow):
         self.table = QTableWidget(0, len(COLUMNS))
         self.table.setHorizontalHeaderLabels(COLUMNS)
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table.verticalHeader().setVisible(False)
         hdr = self.table.horizontalHeader()
@@ -104,8 +105,9 @@ class MainWindow(QMainWindow):
         self.verify_btn.clicked.connect(self.toggle_verified)
         self.verify_btn.setEnabled(False)
         self.stream_btn = QPushButton("Stream this computer's audio here")
-        self.stream_btn.setToolTip("Sends everything this computer plays to the selected Cast speaker, "
-                                   "group or stereo pair. Stop to switch audio back.")
+        self.stream_btn.setToolTip("Sends everything this computer plays to the selected speakers "
+                                   "(Google Cast or DLNA, any brand). Ctrl+click to pick several. "
+                                   "Stop to switch audio back.")
         self.stream_btn.clicked.connect(self.toggle_stream)
         self.stream_btn.setEnabled(False)
         self.stream_thread: QThread | None = None
@@ -196,12 +198,25 @@ class MainWindow(QMainWindow):
         self.stream_btn.setEnabled(self.stream_worker is not None)
 
     def selected(self):
-        rows = self.table.selectionModel().selectedRows()
+        """The device the details panel shows: the current row, if it is selected."""
+        all_sel = self.selected_all()
+        cur = self.table.currentRow()
         vis = self.visible_devices()
-        return vis[rows[0].row()] if rows and rows[0].row() < len(vis) else None
+        if 0 <= cur < len(vis) and vis[cur] in all_sel:
+            return vis[cur]
+        return all_sel[0] if all_sel else None
+
+    def selected_all(self) -> list:
+        vis = self.visible_devices()
+        return [vis[r.row()] for r in sorted(self.table.selectionModel().selectedRows(), key=lambda r: r.row())
+                if r.row() < len(vis)]
+
+    def streamable_selection(self) -> list:
+        return [t for t in (stream.target_for(d) for d in self.selected_all()) if t]
 
     def show_details(self) -> None:
         d = self.selected()
+        self.stream_btn.setEnabled(self.stream_worker is not None or bool(self.streamable_selection()))
         if d is None:
             return
         label = compat.load()["status_labels"].get(d.status, d.status)
@@ -214,7 +229,6 @@ class MainWindow(QMainWindow):
         html.append("<p><small>Advertised: " + _esc(", ".join(sorted(d.raw_types)) or "-") + "</small></p>")
         self.details.setHtml("".join(html))
         self.verify_btn.setEnabled(d.status != "not_speaker")
-        self.stream_btn.setEnabled(self.stream_worker is not None or "googlecast" in d.protocols)
         self.verify_btn.setText("Remove verified mark" if d.status == "verified"
                                 else "Mark playback verified")
 
@@ -235,16 +249,16 @@ class MainWindow(QMainWindow):
             self.stream_worker.stop.set()
             self.stream_btn.setEnabled(False)
             return
-        d = self.selected()
-        if d is None or "googlecast" not in d.protocols:
+        targets = self.streamable_selection()
+        if not targets:
             return
         self.stream_thread = QThread(self)
-        self.stream_worker = StreamWorker(d.ip, d.protocols["googlecast"].port or 8009)
+        self.stream_worker = StreamWorker(targets)
         self.stream_worker.moveToThread(self.stream_thread)
         self.stream_thread.started.connect(self.stream_worker.run)
         self.stream_worker.status.connect(self.statusBar().showMessage)
         self.stream_worker.done.connect(self.stream_done)
-        self.stream_btn.setText(f"Stop streaming to {d.name}")
+        self.stream_btn.setText(f"Stop streaming to {', '.join(t.name for t in targets)}")
         self.stream_thread.start()
 
     def stream_done(self, msg: str) -> None:
@@ -253,8 +267,7 @@ class MainWindow(QMainWindow):
             self.stream_thread.wait()
         self.stream_thread = self.stream_worker = None
         self.stream_btn.setText("Stream this computer's audio here")
-        d = self.selected()
-        self.stream_btn.setEnabled(d is not None and "googlecast" in d.protocols)
+        self.stream_btn.setEnabled(bool(self.streamable_selection()))
         self.statusBar().showMessage(msg)
 
     def closeEvent(self, event) -> None:

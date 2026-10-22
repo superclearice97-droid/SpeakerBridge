@@ -1,7 +1,7 @@
-"""Tests for Linux -> Cast streaming. Run: python -m unittest discover -s tests
+"""Tests for Linux -> Cast / DLNA streaming. Run: python -m unittest discover -s tests
 
-Uses a fake Cast speaker (TLS on loopback) and fake pactl/parec scripts, so no real
-speaker or PipeWire is needed.
+Uses a fake Cast speaker (TLS on loopback), a fake DLNA renderer (HTTP on loopback) and
+fake pactl/parec scripts, so no real speaker or PipeWire is needed.
 """
 import json
 import os
@@ -17,12 +17,14 @@ import threading
 import time
 import unittest
 import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "linux"))
 
-from speakerbridge import cast, stream  # noqa: E402
+from speakerbridge import cast, cli, dlna, stream  # noqa: E402
+from speakerbridge.model import Device, ProtocolHit  # noqa: E402
 
 
 class WireTests(unittest.TestCase):
@@ -116,6 +118,106 @@ class FakeCast(threading.Thread):
                                               "status": [{"playerState": "PLAYING", "mediaSessionId": 1}]})
 
 
+# ------------------------------------------------------------ fake DLNA renderer
+DESCRIPTION = """<?xml version="1.0"?>
+<root xmlns="urn:schemas-upnp-org:device-1-0">
+  <URLBase>http://127.0.0.1:{port}/</URLBase>
+  <device><friendlyName>Fake Denon</friendlyName>
+    <serviceList>
+      <service><serviceType>urn:schemas-upnp-org:service:RenderingControl:1</serviceType>
+        <controlURL>/rc</controlURL></service>
+      <service><serviceType>urn:schemas-upnp-org:service:AVTransport:1</serviceType>
+        <controlURL>upnp/av</controlURL></service>
+    </serviceList></device>
+</root>"""
+
+
+class FakeDlna:
+    """Serves a description and an AVTransport control URL; on Play it fetches the stream."""
+
+    def __init__(self, reject: str = ""):
+        self.actions, self.fetched, self.reject = [], b"", reject
+        fake = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                body = DESCRIPTION.format(port=fake.port).encode()
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_POST(self):
+                body = self.rfile.read(int(self.headers["Content-Length"])).decode()
+                action = self.headers["SOAPACTION"].strip('"').split("#")[1]
+                fake.actions.append(action)
+                if self.path != "/upnp/av" or action == fake.reject:
+                    self.send_response(500)
+                    self.end_headers()
+                    self.wfile.write(b"<errorDescription>Not supported</errorDescription>")
+                    return
+                if action == "SetAVTransportURI":
+                    fake.uri = body.split("<CurrentURI>")[1].split("</CurrentURI>")[0]
+                self.send_response(200)
+                self.end_headers()
+                if action == "Play":
+                    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+                    with opener.open(fake.uri, timeout=5) as r:
+                        fake.fetched = r.read(44 + stream.CHUNK)
+
+            def log_message(self, *a):
+                pass
+
+        self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.port = self.httpd.server_address[1]
+        self.location = f"http://127.0.0.1:{self.port}/desc.xml"
+        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+
+    def target(self, name="Fake Denon"):
+        return stream.Target(name, "dlna_renderer", "127.0.0.1", location=self.location)
+
+    def close(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+
+
+class DlnaTests(unittest.TestCase):
+    def test_finds_av_transport_and_resolves_against_urlbase(self):
+        xml = DESCRIPTION.format(port=1234)
+        self.assertEqual(dlna.av_transport(xml, "http://127.0.0.1:1234/desc.xml"),
+                         ("urn:schemas-upnp-org:service:AVTransport:1", "http://127.0.0.1:1234/upnp/av"))
+
+    def test_no_av_transport_is_a_clear_error(self):
+        with self.assertRaisesRegex(dlna.DlnaError, "no AVTransport"):
+            dlna.av_transport("<root><device/></root>", "http://127.0.0.1/")
+
+    def test_refuses_addresses_off_the_lan(self):
+        with self.assertRaisesRegex(dlna.DlnaError, "local network"):
+            dlna.DlnaRenderer("http://8.8.8.8/desc.xml")
+
+
+class TargetTests(unittest.TestCase):
+    def _dev(self, name, *protos):
+        d = Device(ip="192.168.1.20", name=name)
+        for p in protos:
+            d.add(ProtocolHit(p, "test", port=8009 if p == "googlecast" else 0,
+                              details={"location": "http://192.168.1.20/d.xml"} if p == "dlna_renderer" else {}))
+        return d
+
+    def test_prefers_cast_then_dlna(self):
+        self.assertEqual(stream.target_for(self._dev("Sony", "googlecast", "dlna_renderer")).protocol, "googlecast")
+        t = stream.target_for(self._dev("Denon", "dlna_renderer"))
+        self.assertEqual((t.protocol, t.location), ("dlna_renderer", "http://192.168.1.20/d.xml"))
+        self.assertIsNone(stream.target_for(self._dev("Spotify only", "spotify_connect")))
+
+    def test_cli_finds_dlna_speakers_by_name(self):
+        devs = [self._dev("Kitchen Nest", "googlecast"), self._dev("Den HEOS", "dlna_renderer"),
+                self._dev("Den Spotify", "spotify_connect")]
+        self.assertEqual(cli.find_target(devs, "heos")[0].name, "Den HEOS")
+        self.assertEqual(cli.find_target(devs, "den")[0].name, "Den HEOS")   # Spotify-only isn't a candidate
+        self.assertIsNone(cli.find_target(devs, "sonos")[0])
+
+
 @unittest.skipUnless(shutil.which("openssl"), "needs openssl to make a test certificate")
 class StreamEndToEnd(unittest.TestCase):
     @classmethod
@@ -125,18 +227,22 @@ class StreamEndToEnd(unittest.TestCase):
                         "-subj", "/CN=fake-cast", "-keyout", f"{cls.tmp}/k.pem", "-out", f"{cls.tmp}/c.pem"],
                        check=True, capture_output=True)
 
-    def _run(self, fake, source, seconds=1.5):
+    def _run(self, targets, source, seconds=1.5):
         stop = threading.Event()
         threading.Timer(seconds, stop.set).start()
         statuses = []
-        stream.run("127.0.0.1", fake.port, stop, source=source, on_status=statuses.append)
+        failures = stream.run(targets, stop, source=source, on_status=statuses.append)
         time.sleep(0.3)
-        return statuses
+        return statuses, failures
+
+    @staticmethod
+    def _cast_target(fake, name="Fake Nest"):
+        return stream.Target(name, "googlecast", "127.0.0.1", port=fake.port)
 
     def test_streams_live_wav_and_stops_cleanly(self):
         fake = FakeCast(self.tmp)
         fake.start()
-        statuses = self._run(fake, silence())
+        statuses, _ = self._run([self._cast_target(fake)], silence())
         self.assertEqual(fake.load["media"]["streamType"], "LIVE")
         self.assertEqual(fake.load["media"]["contentType"], "audio/wav")
         self.assertEqual(fake.fetched[:4], b"RIFF")
@@ -168,7 +274,7 @@ esac
         try:
             fake = FakeCast(self.tmp)
             fake.start()
-            self._run(fake, None)
+            self._run([self._cast_target(fake)], None)
         finally:
             os.environ["PATH"] = old
         calls = log.read_text().splitlines()
@@ -177,6 +283,56 @@ esac
         self.assertIn("set-default-sink alsa_output.hdmi", calls)
         self.assertEqual(calls[-1], "unload-module 42")
         self.assertEqual(fake.fetched[:4], b"RIFF")
+
+    def test_streams_to_a_dlna_speaker_and_stops_it(self):
+        fake = FakeDlna()
+        try:
+            statuses, failures = self._run([fake.target()], silence())
+        finally:
+            fake.close()
+        self.assertEqual(fake.actions, ["Stop", "SetAVTransportURI", "Play", "Stop"])
+        self.assertEqual(fake.fetched[:4], b"RIFF")
+        self.assertEqual(len(fake.fetched), 44 + stream.CHUNK)
+        self.assertEqual(failures, [])
+        self.assertTrue(any("Streaming over DLNA" in s for s in statuses))
+
+    def test_mixed_brands_play_the_same_stream_at_once(self):
+        cast_fake, dlna_fake = FakeCast(self.tmp), FakeDlna()
+        cast_fake.start()
+        try:
+            statuses, failures = self._run([self._cast_target(cast_fake), dlna_fake.target()], silence())
+        finally:
+            dlna_fake.close()
+        self.assertEqual(failures, [])
+        self.assertEqual(cast_fake.fetched[:4], b"RIFF")
+        self.assertEqual(dlna_fake.fetched[:4], b"RIFF")
+        self.assertEqual(cast_fake.load["media"]["contentId"], dlna_fake.uri)   # one shared stream
+        self.assertIn("STOP", cast_fake.events)
+        self.assertEqual(dlna_fake.actions[-1], "Stop")
+        self.assertTrue(any(s.startswith("Fake Nest: Streaming") for s in statuses))
+        self.assertTrue(any(s.startswith("Fake Denon: Streaming") for s in statuses))
+        self.assertTrue(any("buffer differently" in s for s in statuses))
+
+    def test_one_speaker_failing_does_not_stop_the_others(self):
+        cast_fake, bad = FakeCast(self.tmp), FakeDlna(reject="SetAVTransportURI")
+        cast_fake.start()
+        try:
+            statuses, failures = self._run([self._cast_target(cast_fake), bad.target("Old Receiver")], silence())
+        finally:
+            bad.close()
+        self.assertEqual(len(failures), 1)
+        self.assertIn("Old Receiver", failures[0])
+        self.assertIn("Not supported", failures[0])
+        self.assertEqual(cast_fake.fetched[:4], b"RIFF")
+        self.assertIn("STOP", cast_fake.events)
+
+    def test_raises_when_no_speaker_can_play(self):
+        bad = FakeDlna(reject="Play")
+        try:
+            with self.assertRaisesRegex(stream.StreamError, "rejected Play"):
+                self._run([bad.target()], silence())
+        finally:
+            bad.close()
 
 
 if __name__ == "__main__":

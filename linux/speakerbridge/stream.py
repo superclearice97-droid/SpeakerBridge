@@ -1,10 +1,11 @@
-"""Streams this computer's audio to a Cast speaker (v0.2).
+"""Streams this computer's audio to one or more speakers, of any brand (v0.2/0.3).
 
 How it works:
   1. A virtual PipeWire output called "SpeakerBridge" is created and made the default,
      so whatever the computer plays goes there instead of the local speakers.
   2. That output is recorded (parec) and served as a live WAV stream on your LAN only.
-  3. The speaker is told to play that stream. Stopping puts everything back.
+  3. Every chosen speaker is told to play that stream, over Google Cast or DLNA,
+     whichever it speaks. Stopping puts everything back.
 """
 from __future__ import annotations
 
@@ -14,10 +15,12 @@ import socket
 import struct
 import subprocess
 import threading
+from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Iterable, Iterator
 
 from .cast import NS_MEDIA, NS_RECEIVER, APP_ID, CastError, CastSession
+from .dlna import DlnaError, DlnaRenderer
 
 RATE, CHANNELS = 48000, 2
 SINK = "speakerbridge"
@@ -26,6 +29,28 @@ CHUNK = RATE * CHANNELS * 2 // 50   # 20 ms of 16-bit audio
 
 class StreamError(Exception):
     pass
+
+
+@dataclass
+class Target:
+    """A speaker to stream to and how to reach it."""
+    name: str
+    protocol: str        # "googlecast" or "dlna_renderer"
+    host: str
+    port: int = 0        # Cast
+    location: str = ""   # DLNA description URL
+
+
+def target_for(dev) -> Target | None:
+    """How to stream to a discovered Device: Cast when it has it (Google keeps groups and
+    stereo pairs in sync), else DLNA. None when it offers neither."""
+    cast = dev.protocols.get("googlecast")
+    if cast:
+        return Target(dev.name, "googlecast", dev.ip, port=cast.port or 8009)
+    dlna = dev.protocols.get("dlna_renderer")
+    if dlna and dlna.details.get("location"):
+        return Target(dev.name, "dlna_renderer", dev.ip, location=dlna.details["location"])
+    return None
 
 
 def wav_header(rate: int = RATE, channels: int = CHANNELS) -> bytes:
@@ -205,45 +230,94 @@ class LiveServer:
 
 
 # ------------------------------------------------------------ putting it together
-def run(host: str, port: int, stop: threading.Event, source: Iterable[bytes] | None = None,
-        fmt: str = "wav", on_status=print) -> None:
-    """Streams to one Cast speaker (or group / stereo pair) until `stop` is set or the
-    speaker stops. Blocking. `source` replaces the PipeWire capture (used by tests)."""
+TITLE = "This computer (SpeakerBridge)"
+
+
+def run(targets: list[Target], stop: threading.Event, source: Iterable[bytes] | None = None,
+        fmt: str = "wav", on_status=print) -> list[str]:
+    """Streams to every target at once until `stop` is set or every speaker has stopped.
+    Blocking. A speaker that fails doesn't stop the others; returns their error messages
+    (raises StreamError if none could play). `source` replaces the PipeWire capture (tests)."""
+    if not targets:
+        raise StreamError("no speakers to stream to")
+    bind_ip = local_ip_for(targets[0].host)
+    say = (lambda t, msg: on_status(f"{t.name}: {msg}")) if len(targets) > 1 else (lambda t, msg: on_status(msg))
+    failures: list[str] = []
+
     capture = PipeWireCapture(fmt) if source is None else None
     with (capture if capture else _nullctx()):
-        server = LiveServer(capture.chunks() if capture else source, local_ip_for(host), fmt)
-        session = None
+        server = LiveServer(capture.chunks() if capture else source, bind_ip, fmt)
+
+        def play(t: Target) -> None:
+            try:
+                if local_ip_for(t.host) != bind_ip:
+                    raise StreamError(f"it is on a different network from {targets[0].name}")
+                (_play_cast if t.protocol == "googlecast" else _play_dlna)(t, server, stop, lambda m: say(t, m))
+            except (StreamError, CastError, DlnaError, OSError) as exc:
+                if len(targets) == 1:
+                    failures.append(str(exc))
+                else:
+                    failures.append(f"{t.name}: {exc}")
+                    say(t, f"Couldn't stream: {exc}. The other speakers carry on.")
+
+        if len({t.protocol for t in targets}) > 1:
+            on_status("Note: Cast and DLNA speakers buffer differently, so they can be a second "
+                      "or two apart. Fine for different rooms; in one room it will echo.")
+        threads = [threading.Thread(target=play, args=(t,), daemon=True) for t in targets]
         try:
-            on_status("Connecting to the speaker…")
-            session = CastSession(host, port)
-            session.launch()
-            session.load(server.url, server.content_type, "This computer (SpeakerBridge)",
-                         stream_type="LIVE", autoplay=True)
-            on_status("Streaming. Anything this computer plays now comes out of the speaker. "
-                      "Stop to switch audio back.")
-
-            def ended(ns, p):
-                if ns == NS_RECEIVER and p.get("type") == "RECEIVER_STATUS":
-                    apps = (p.get("status") or {}).get("applications") or []
-                    return not any(a.get("appId") == APP_ID for a in apps)
-                if ns == NS_MEDIA:
-                    for st in p.get("status") or []:
-                        if st.get("playerState") == "IDLE":
-                            return True
-                return False
-
-            while not stop.is_set():
-                if session.wait(0.5, ended):
-                    on_status("The speaker stopped the stream (it was stopped from elsewhere or "
-                              "lost the connection).")
-                    break
-        except CastError as exc:
-            raise StreamError(str(exc)) from exc
+            for th in threads:
+                th.start()
+            for th in threads:
+                th.join()
         finally:
-            if session:
-                session.stop()
-                session.close()
+            stop.set()   # on Ctrl+C too, so every speaker is told to stop before audio switches back
+            for th in threads:
+                th.join(timeout=10)
             server.close()
+    if len(failures) == len(targets):
+        raise StreamError("; ".join(failures))
+    return failures
+
+
+def _play_cast(t: Target, server: LiveServer, stop: threading.Event, say) -> None:
+    say("Connecting to the speaker…")
+    session = CastSession(t.host, t.port or 8009)
+    try:
+        session.launch()
+        session.load(server.url, server.content_type, TITLE, stream_type="LIVE", autoplay=True)
+        say("Streaming. Anything this computer plays now comes out of the speaker. "
+            "Stop to switch audio back.")
+
+        def ended(ns, p):
+            if ns == NS_RECEIVER and p.get("type") == "RECEIVER_STATUS":
+                apps = (p.get("status") or {}).get("applications") or []
+                return not any(a.get("appId") == APP_ID for a in apps)
+            if ns == NS_MEDIA:
+                for st in p.get("status") or []:
+                    if st.get("playerState") == "IDLE":
+                        return True
+            return False
+
+        while not stop.is_set():
+            if session.wait(0.5, ended):
+                say("The speaker stopped the stream (it was stopped from elsewhere or "
+                    "lost the connection).")
+                break
+    finally:
+        session.stop()
+        session.close()
+
+
+def _play_dlna(t: Target, server: LiveServer, stop: threading.Event, say) -> None:
+    say("Connecting to the speaker over DLNA…")
+    renderer = DlnaRenderer(t.location)
+    try:
+        renderer.play(server.url, server.content_type, TITLE)
+        say("Streaming over DLNA. Anything this computer plays now comes out of the speaker. "
+            "Stop to switch audio back.")
+        stop.wait()
+    finally:
+        renderer.stop()
 
 
 class _nullctx:

@@ -19,14 +19,19 @@ speakerbridge-scan               # same scan in the terminal
 speakerbridge-scan --json        # machine-readable output
 ```
 
-**Stream this computer's audio to a Cast speaker (new):**
+**Stream this computer's audio to speakers of different brands at once (new):**
 
 ```bash
-speakerbridge-stream "Living Room"            # name, part of a name, or device key
-speakerbridge-stream "Living Room" --format mp3   # if a speaker won't play the default WAV stream (needs ffmpeg)
+speakerbridge-stream "Living Room"                    # name, part of a name, or device key
+speakerbridge-stream "Kitchen Nest" "Sony" "Den HEOS"  # several speakers, any mix of brands
+speakerbridge-stream "Living Room" --format mp3        # if a speaker won't play the default WAV stream (needs ffmpeg)
 ```
 
-Or select the speaker in the desktop app and press **Stream this computer's audio here**. SpeakerBridge adds a virtual output called "SpeakerBridge", makes it the default, and moves what's already playing onto it, so everything the computer plays goes to the speaker. Stop (Ctrl+C or the button) and audio switches back to your usual output. Works with single speakers, Google Home speaker groups and stereo pairs. The stream stays on your local network. Cast speakers buffer a second or two, so for now this suits music rather than lip-synced video.
+Or select speakers in the desktop app (Ctrl+click to pick several) and press **Stream this computer's audio here**. SpeakerBridge adds a virtual output called "SpeakerBridge", makes it the default, and moves what's already playing onto it, so everything the computer plays goes to the speakers. Stop (Ctrl+C or the button) and audio switches back to your usual output.
+
+Each speaker gets the same stream over whichever protocol it speaks: **Google Cast** (Nest, Chromecast built-in Sony / Vizio / JBL and others, Google Home speaker groups and stereo pairs) or **DLNA / UPnP** (many Denon/HEOS, Yamaha MusicCast, LG, Samsung and older Sony speakers). If a speaker offers both, Cast is used. If one speaker can't play, the others keep going. The stream stays on your local network.
+
+Sync, honestly: every speaker buffers a second or two, so this suits music rather than lip-synced video. Speakers inside one Google Home group stay tightly in sync. Separate speakers, especially Cast and DLNA ones mixed, can be up to a second or two apart. That's fine for different rooms; in one room you'll hear an echo. Fixing that is the 0.4 sync engine. Until then, for one room, put the Cast speakers into a Google Home group and stream to the group.
 
 Without installing, from the repo: `cd linux && python3 -m speakerbridge` (GUI) or `python3 -m speakerbridge scan`.
 
@@ -85,7 +90,7 @@ The scanner flags this when it sees a non-Google speaker with Cast ("can join a 
 |---|---|---|
 | 0.1 | Discovery on Linux + Android, shared compatibility database | **Done** |
 | 0.2 | Linux → Google Cast (single speakers and Cast groups) via an HTTP stream of PipeWire audio; AirPlay (RAOP) via PipeWire's built-in module | Cast streaming done; AirPlay next |
-| 0.3 | Multiple targets at once, saved groups, per-speaker volume | |
+| 0.3 | Multiple targets at once, saved groups, per-speaker volume | Linux: Cast + DLNA speakers at once done; saved groups and volume next |
 | 0.4 | Sync engine: delay calibration for DLNA / mixed targets, drift monitoring | |
 | 0.5 | Android as an audio source (AudioPlaybackCapture, with your consent) | |
 | 0.6 | Sony / Vizio control APIs for volume and input, more DLNA devices | |
@@ -97,7 +102,7 @@ The scanner flags this when it sees a non-Google speaker with Cast ("can join a 
 
 ```
 android/                 Kotlin + Jetpack Compose app (discovery, compat, UI)
-linux/speakerbridge/     Python package: mdns.py, ssdp.py, scanner.py, compat.py, cli.py, gui.py
+linux/speakerbridge/     Python package: mdns.py, ssdp.py, scanner.py, compat.py, cli.py, gui.py, cast.py, dlna.py, stream.py
 shared/compatibility/    compatibility.json, the protocol and brand database both apps use
 shared/device-model/     JSON schema for exported devices
 scripts/                 install-cachyos.sh, diagnose-audio.sh
@@ -113,6 +118,6 @@ tests/                   Linux unit + loopback tests (python3 -m unittest discov
 ## Testing
 
 ```bash
-python3 -m unittest discover -s tests     # Linux: wire format, loopback mDNS/SSDP, classification
+python3 -m unittest discover -s tests     # Linux: wire format, loopback mDNS/SSDP, classification, Cast + DLNA streaming
 cd android && ./gradlew test               # Android: mDNS wire format + AirPlay 2 detection
 ```
