@@ -41,7 +41,17 @@ speakerbridge-stream --calibrate "Kitchen Nest" "Den HEOS"
 
 Every speaker plays a click once a second. If you hear two clicks close together, add delay to the speaker that clicks first (`1 +50`, `1 -25`, `1 =400`) until you hear one click, then type `q` to save. In the desktop app, select the speakers, tick **Play sync clicks**, press Stream, and adjust each speaker's **Sync delay** box. Changes apply while it plays. Delays (0–3000 ms) are saved per speaker in `~/.config/speakerbridge/delays.json` and used every time you stream to that speaker. Nothing is recorded; you line them up by ear.
 
-Good to know: a speaker can only be held back, not sped up, so the slowest speaker stays at 0. Each speaker's clock runs very slightly differently, so over a long session they can drift apart a little; stopping and starting the stream lines them up again. With `--format mp3`, a delay changed mid-stream takes effect on the next stream.
+Good to know: a speaker can only be held back, not sped up, so the slowest speaker stays at 0. With `--format mp3`, a delay changed mid-stream takes effect on the next stream.
+
+**Staying in sync (drift correction):** each speaker's clock runs very slightly fast or slow, enough to slide a couple of hundred ms apart over an hour. While streaming, SpeakerBridge asks each speaker how far it has played and, when one has slid from where it started, inserts or skips a few ms of audio for that speaker (with a 2 ms fade, so it doesn't click). It's automatic. You'll see the occasional "Nudged +15 ms to stay in sync" message. How tight it holds depends on what the speaker reports:
+
+| Speaker reports | Kept within |
+|---|---|
+| Google Cast (to the millisecond) | about ±15 ms |
+| DLNA with fractions of a second | about ±15 ms |
+| DLNA in whole seconds (most) | about ±30 ms |
+
+A speaker that doesn't report its position, or whose reports don't add up, isn't touched: SpeakerBridge says so and leaves it alone rather than guess. Drift correction needs the default WAV stream (not `--format mp3`).
 
 Without installing, from the repo: `cd linux && python3 -m speakerbridge` (GUI) or `python3 -m speakerbridge scan`.
 
@@ -101,7 +111,7 @@ The scanner flags this when it sees a non-Google speaker with Cast ("can join a 
 | 0.1 | Discovery on Linux + Android, shared compatibility database | **Done** |
 | 0.2 | Linux → Google Cast (single speakers and Cast groups) via an HTTP stream of PipeWire audio; AirPlay (RAOP) via PipeWire's built-in module | Cast streaming done; AirPlay next |
 | 0.3 | Multiple targets at once, saved groups, per-speaker volume | Linux: Cast + DLNA speakers at once done; saved groups and volume next |
-| 0.4 | Sync engine: delay calibration for DLNA / mixed targets, drift monitoring | Linux: per-speaker sync delay, calibrated by ear, done; drift monitoring next |
+| 0.4 | Sync engine: delay calibration for DLNA / mixed targets, drift monitoring | Linux: per-speaker sync delay (by ear) and drift correction done; microphone calibration next |
 | 0.5 | Android as an audio source (AudioPlaybackCapture, with your consent) | |
 | 0.6 | Sony / Vizio control APIs for volume and input, more DLNA devices | |
 | 1.0 | Stable release, APK + Linux package, docs | |
@@ -112,7 +122,7 @@ The scanner flags this when it sees a non-Google speaker with Cast ("can join a 
 
 ```
 android/                 Kotlin + Jetpack Compose app (discovery, compat, UI)
-linux/speakerbridge/     Python package: mdns.py, ssdp.py, scanner.py, compat.py, cli.py, gui.py, cast.py, dlna.py, stream.py
+linux/speakerbridge/     Python package: mdns.py, ssdp.py, scanner.py, compat.py, cli.py, gui.py, cast.py, dlna.py, stream.py, drift.py
 shared/compatibility/    compatibility.json, the protocol and brand database both apps use
 shared/device-model/     JSON schema for exported devices
 scripts/                 install-cachyos.sh, diagnose-audio.sh

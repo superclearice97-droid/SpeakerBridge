@@ -85,6 +85,17 @@ class DlnaRenderer:
                   f"<CurrentURI>{_esc(url)}</CurrentURI><CurrentURIMetaData>{_esc(didl)}</CurrentURIMetaData>")
         self.soap("Play", "<Speed>1</Speed>")
 
+    def position(self) -> tuple[float, bool] | None:
+        """(seconds played, whether it only reports whole seconds), or None if it won't say."""
+        try:
+            m = re.search(r"<RelTime>\s*(\d+):(\d\d):(\d\d)(\.\d+)?\s*</RelTime>", self.soap("GetPositionInfo"))
+        except DlnaError:
+            return None
+        if not m:
+            return None   # NOT_IMPLEMENTED or missing
+        h, mi, sec, frac = m.groups()
+        return int(h) * 3600 + int(mi) * 60 + int(sec) + float(frac or 0), frac is None
+
     def stop(self) -> None:
         """Best effort."""
         try:

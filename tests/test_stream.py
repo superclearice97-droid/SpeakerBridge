@@ -23,7 +23,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "linux"))
 
-from speakerbridge import cast, cli, dlna, store, stream  # noqa: E402
+from speakerbridge import cast, cli, dlna, drift, store, stream  # noqa: E402
 from speakerbridge.model import Device, ProtocolHit  # noqa: E402
 
 
@@ -64,6 +64,12 @@ def numbered():
 def frames(r, n_bytes):
     data = r.read(n_bytes)
     return [struct.unpack_from("<I", data, k)[0] for k in range(0, len(data) - 3, 4)]
+
+
+def chunk_ids(values):
+    """The chunk numbers that arrived (whole or mostly), ignoring the few faded frames."""
+    from collections import Counter
+    return sorted(v for v, c in Counter(values).items() if v and c >= 100)
 
 
 def runs(values):
@@ -135,11 +141,12 @@ class LiveServerTest(unittest.TestCase):
         finally:
             srv.close()
         self.assertNotIn(0, before)
-        r_after = runs(after)
-        silences = [c for v, c in r_after if v == 0]
-        self.assertEqual(silences, [100 * stream.BYTES_PER_MS // 4])   # exactly 100 ms, once
-        audio = [v for v in before + after if v]
-        self.assertEqual(sorted(set(audio)), list(range(min(audio), max(audio) + 1)))   # nothing skipped
+        silences = [c for v, c in runs(after) if v == 0]
+        self.assertEqual(len(silences), 1)
+        # exactly 100 ms, give or take the 2 ms fade either side rounding to zero
+        self.assertLessEqual(abs(silences[0] - 100 * stream.BYTES_PER_MS // 4), 2 * stream.FADE_FRAMES)
+        ids = chunk_ids(before + after)
+        self.assertEqual(ids, list(range(ids[0], ids[-1] + 1)))   # nothing skipped
 
     def test_lowering_the_delay_mid_stream_skips_audio(self):
         delays = {0: 200}
@@ -152,10 +159,11 @@ class LiveServerTest(unittest.TestCase):
                 after = frames(r, stream.CHUNK * 10)
         finally:
             srv.close()
-        self.assertNotIn(0, before + after)
-        seen = sorted(set(before + after))
+        silences = [c for v, c in runs(before + after) if v == 0]
+        self.assertTrue(all(c <= 2 * stream.FADE_FRAMES for c in silences))   # no silence added
+        seen = chunk_ids(before + after)
         missing = [i for i in range(seen[0], seen[-1]) if i not in seen]
-        self.assertEqual(len(missing), 100 // 20)   # 100 ms = 5 chunks skipped, no silence added
+        self.assertEqual(len(missing), 100 // 20)   # 100 ms = 5 chunks skipped
 
     def test_click_track(self):
         import itertools
@@ -165,19 +173,69 @@ class LiveServerTest(unittest.TestCase):
         self.assertFalse(any(second))
 
 
-# ------------------------------------------------------------ fake Cast speaker
+# ------------------------------------------------------------ fake speakers
+BPS = stream.BYTES_PER_MS * 1000
+
+
+class FakePlayer:
+    """Plays a stream the way a real speaker does: starts `buffer_s` after the first audio
+    arrives, then runs on its own clock, `ppm` fast (+) or slow (-). Logs when each click
+    (sound after 100 ms of silence) would be heard."""
+
+    def __init__(self, buffer_s=0.3, ppm=0.0):
+        self.buffer_s, self.rate = buffer_s, 1 + ppm * 1e-6
+        self.fetched, self.heard, self.t_start = b"", [], None
+        self.ready = threading.Event()
+
+    def start(self, url):
+        threading.Thread(target=self._play, args=(url,), daemon=True).start()
+        self.ready.wait(5)   # a real speaker reports PLAYING once it has data
+
+    def _play(self, url):
+        try:
+            with OPEN(url, timeout=5) as r:
+                head, pos, quiet = r.read(44), 0, 10 ** 9
+                while True:
+                    b = r.read(stream.CHUNK)
+                    if not b:
+                        return
+                    if self.t_start is None:
+                        self.t_start = time.monotonic() + self.buffer_s
+                        self.fetched = head + b
+                        self.ready.set()
+                    if any(b):
+                        i = next(k for k, x in enumerate(b) if x) & ~3
+                        if quiet + i >= 100 * stream.BYTES_PER_MS:
+                            self.heard.append(self.t_start + (pos + i) / (BPS * self.rate))
+                        quiet = len(b) - len(b.rstrip(b"\0"))
+                    else:
+                        quiet += len(b)
+                    pos += len(b)
+        except OSError:
+            pass
+
+    def position(self):
+        """Seconds of the stream played so far, by the speaker's own clock."""
+        return max(0.0, time.monotonic() - self.t_start) * self.rate if self.t_start else 0.0
+
+
 class FakeCast(threading.Thread):
     """Accepts one sender, behaves like the Default Media Receiver, records what happened."""
 
-    def __init__(self, certdir):
+    def __init__(self, certdir, player=None):
         super().__init__(daemon=True)
+        self.player = player or FakePlayer()
         self.ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         self.ctx.load_cert_chain(f"{certdir}/c.pem", f"{certdir}/k.pem")
         self.srv = socket.socket()
         self.srv.bind(("127.0.0.1", 0))
         self.srv.listen(1)
         self.port = self.srv.getsockname()[1]
-        self.events, self.fetched = [], b""
+        self.events = []
+
+    @property
+    def fetched(self):
+        return self.player.fetched
 
     def run(self):
         c = self.ctx.wrap_socket(self.srv.accept()[0], server_side=True)
@@ -212,11 +270,12 @@ class FakeCast(threading.Thread):
                     "applications": [{"appId": cast.APP_ID, "sessionId": "S1", "transportId": "web-1"}]}})
             elif p.get("type") == "LOAD":
                 self.load = p
-                opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-                with opener.open(p["media"]["contentId"], timeout=5) as r:
-                    self.fetched = r.read(44 + stream.CHUNK)
+                self.player.start(p["media"]["contentId"])
                 send("web-1", cast.NS_MEDIA, {"type": "MEDIA_STATUS",
                                               "status": [{"playerState": "PLAYING", "mediaSessionId": 1}]})
+            elif p.get("type") == "GET_STATUS":
+                send("web-1", cast.NS_MEDIA, {"type": "MEDIA_STATUS", "status": [{
+                    "playerState": "PLAYING", "mediaSessionId": 1, "currentTime": self.player.position()}]})
 
 
 # ------------------------------------------------------------ fake DLNA renderer
@@ -236,8 +295,9 @@ DESCRIPTION = """<?xml version="1.0"?>
 class FakeDlna:
     """Serves a description and an AVTransport control URL; on Play it fetches the stream."""
 
-    def __init__(self, reject: str = ""):
-        self.actions, self.fetched, self.reject = [], b"", reject
+    def __init__(self, reject: str = "", player=None, whole_seconds=True):
+        self.actions, self.reject = [], reject
+        self.player, self.whole_seconds = player or FakePlayer(), whole_seconds
         fake = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -259,12 +319,19 @@ class FakeDlna:
                     return
                 if action == "SetAVTransportURI":
                     fake.uri = body.split("<CurrentURI>")[1].split("</CurrentURI>")[0]
+                if action == "Play":
+                    fake.player.start(fake.uri)
+                reply = b""
+                if action == "GetPositionInfo":
+                    pos = fake.player.position()
+                    whole = int(pos)
+                    rel = f"{whole // 3600}:{whole // 60 % 60:02d}:{whole % 60:02d}"
+                    if not fake.whole_seconds:
+                        rel += f"{pos - whole:.3f}"[1:]
+                    reply = f"<s:Envelope><s:Body><RelTime>{rel}</RelTime></s:Body></s:Envelope>".encode()
                 self.send_response(200)
                 self.end_headers()
-                if action == "Play":
-                    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-                    with opener.open(fake.uri, timeout=5) as r:
-                        fake.fetched = r.read(44 + stream.CHUNK)
+                self.wfile.write(reply)
 
             def log_message(self, *a):
                 pass
@@ -273,6 +340,10 @@ class FakeDlna:
         self.port = self.httpd.server_address[1]
         self.location = f"http://127.0.0.1:{self.port}/desc.xml"
         threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+
+    @property
+    def fetched(self):
+        return self.player.fetched
 
     def target(self, name="Fake Denon"):
         return stream.Target(name, "dlna_renderer", "127.0.0.1", location=self.location)
@@ -347,6 +418,133 @@ class CalibrationTests(unittest.TestCase):
                 del os.environ["XDG_CONFIG_HOME"]
             else:
                 os.environ["XDG_CONFIG_HOME"] = old
+
+
+class SimSpeaker:
+    """Simulated time: what LiveServer does for one listener (send each 20 ms chunk when
+    it's due, apply nudges) plus a speaker whose clock is `ppm` off. Fast enough to run an
+    hour of playback in about a second."""
+
+    def __init__(self, ppm, buffer_s=1.5, whole_seconds=False, monitor=True):
+        self.tl, self.rate = stream.Timeline(), 1 + ppm * 1e-6
+        self.buffer_s, self.whole_seconds = buffer_s, whole_seconds
+        self.said = []
+        self.mon = drift.DriftMonitor(lambda: self.tl, self.said.append, BPS) if monitor else None
+
+    def latency_at(self, t, t_start):
+        """True capture-to-ear latency at time t (None while inserted silence plays)."""
+        c = self.tl.capture_time(int((t - t_start) * self.rate * BPS))
+        return None if c is None else t - c
+
+    def run(self, seconds, poll_s):
+        import random as rnd
+        rng = rnd.Random(7)
+        t, c_next, skip_s, t_start = 0.0, 0.0, 0.0, None
+        next_poll, latencies = 1.0, []
+        while t < seconds:
+            t += 0.02
+            while c_next + 0.02 <= t:          # what LiveServer sends (no planned delay here)
+                c_next += skip_s
+                skip_s = 0.0
+                self.tl.add(stream.CHUNK, c_next)
+                c_next += 0.02
+                if t_start is None:
+                    t_start = t + self.buffer_s
+                n = self.tl.take_nudge()
+                if n > 0:
+                    self.tl.add(n * stream.BYTES_PER_MS, None)
+                elif n < 0:
+                    skip_s = -n / 1000
+                if n:
+                    self.tl.changed(n)
+            if t_start is None or t < t_start:
+                continue
+            played = (t - t_start) * self.rate
+            if self.mon and t >= next_poll:
+                rtt = rng.uniform(0.002, 0.02)
+                report = int(played) if self.whole_seconds else played
+                self.mon.sample(t + rtt / 2, report, whole_seconds=self.whole_seconds, half_rtt=rtt / 2)
+                next_poll = t + (rng.uniform(0.5, 1.5) if self.whole_seconds else 2.0)
+            if round(t * 50) % 50 == 0:          # once a second
+                lat = self.latency_at(t, t_start)
+                if lat is not None:
+                    latencies.append((t, lat))
+        return latencies
+
+
+class DriftTests(unittest.TestCase):
+    def _spread_ms(self, latencies, after=60):
+        late = [lat for t, lat in latencies if t > after]
+        return (max(late) - min(late)) * 1000
+
+    def test_without_monitoring_an_hour_drifts_apart(self):
+        lat = SimSpeaker(ppm=50, monitor=False).run(3600, 2.0)
+        self.assertGreater(self._spread_ms(lat), 170)   # 50 ppm = 180 ms an hour
+
+    def test_cast_style_reports_keep_a_fast_or_slow_speaker_in_line_for_an_hour(self):
+        for ppm in (50, -50, 200, -200):
+            sim = SimSpeaker(ppm=ppm)
+            lat = sim.run(3600, 2.0)
+            self.assertLess(self._spread_ms(lat), 2 * drift.PRECISE_THRESHOLD_MS + 5, ppm)
+            self.assertTrue(sim.mon.enabled, sim.said)
+            word = "fast" if ppm > 0 else "slow"
+            self.assertTrue(sim.said and all(word in m for m in sim.said), (ppm, sim.said[:3]))
+
+    def test_whole_second_dlna_reports_still_keep_it_in_line(self):
+        for ppm in (50, -200):
+            sim = SimSpeaker(ppm=ppm, whole_seconds=True)
+            lat = sim.run(3600, 1.0)
+            # whole seconds only pin the latency down to a few tens of ms; uncorrected this
+            # would spread 180 ms (50 ppm) or 720 ms (200 ppm) in the hour
+            self.assertLess(self._spread_ms(lat), 80, ppm)
+            self.assertTrue(sim.mon.enabled, sim.said)
+
+    def test_a_perfect_clock_is_left_alone(self):
+        sim = SimSpeaker(ppm=0, whole_seconds=True)
+        sim.run(1800, 1.0)
+        self.assertEqual(sim.said, [])
+
+    def test_a_speaker_that_does_not_advance_is_not_corrected(self):
+        tl, said = stream.Timeline(), []
+        mon = drift.DriftMonitor(lambda: tl, said.append, BPS)
+        for k in range(1000):
+            tl.add(stream.CHUNK, k * 0.02)
+        for i in range(20):
+            mon.sample(1.0 + i, 0.0)
+        self.assertFalse(mon.enabled)
+        self.assertEqual(tl.take_nudge(), 0)
+        self.assertIn("doesn't report", said[-1])
+
+    def test_jumpy_precise_reports_are_never_acted_on(self):
+        import random as rnd
+        rng = rnd.Random(3)
+        tl, said = stream.Timeline(), []
+        mon = drift.DriftMonitor(lambda: tl, said.append, BPS)
+        for k in range(1500):
+            tl.add(stream.CHUNK, k * 0.02)
+        t = 2.0
+        for i in range(60):   # a receiver whose currentTime only updates now and then
+            mon.sample(t, t - 1.0 - rng.uniform(0, 0.8))
+            t += 0.3
+        self.assertEqual(tl.take_nudge(), 0)
+        self.assertFalse(mon.enabled)
+        self.assertIn("too jumpy", said[-1])
+
+    def test_an_implausible_jump_stops_monitoring(self):
+        tl, said = stream.Timeline(), []
+        mon = drift.DriftMonitor(lambda: tl, said.append, BPS)
+        for k in range(1500):
+            tl.add(stream.CHUNK, k * 0.02)
+        t = 2.0
+        for i in range(12):                    # steady 1.0 s latency: becomes the baseline
+            mon.sample(t, t - 1.0)
+            t += 1
+        for i in range(5):                     # then it claims to be 5 s behind
+            mon.sample(t, t - 6.0)
+            t += 1
+        self.assertFalse(mon.enabled)
+        self.assertEqual(tl.take_nudge(), 0)
+        self.assertIn("jumped", said[-1])
 
 
 @unittest.skipUnless(shutil.which("openssl"), "needs openssl to make a test certificate")
@@ -424,7 +622,8 @@ esac
             statuses, failures = self._run([fake.target()], silence())
         finally:
             fake.close()
-        self.assertEqual(fake.actions, ["Stop", "SetAVTransportURI", "Play", "Stop"])
+        self.assertEqual([a for a in fake.actions if a != "GetPositionInfo"],
+                         ["Stop", "SetAVTransportURI", "Play", "Stop"])
         self.assertEqual(fake.fetched[:4], b"RIFF")
         self.assertEqual(len(fake.fetched), 44 + stream.CHUNK)
         self.assertEqual(failures, [])
@@ -459,6 +658,53 @@ esac
             dlna_fake.close()
         self.assertIn("/0/", cast_fake.load["media"]["contentId"])
         self.assertIn("/1/", dlna_fake.uri)
+
+    def _drift_run(self, targets, players, seconds):
+        """Streams clicks with drift timings sped up (a 2% clock error instead of 50 ppm, so
+        readings a second or two apart really do differ by tens of ms)."""
+        from unittest import mock
+        fast = dict(CAST_POLL_S=0.1, DLNA_POLL_S=(0.03, 0.08), WARMUP_S=1.0, MAX_PPM=50000,
+                    PRECISE_MAX_SPREAD_S=0.1)
+        with mock.patch.multiple(drift, **fast):
+            statuses, failures = self._run(targets, stream.clicks(), seconds=seconds)
+        self.assertEqual(failures, [])
+        intervals = []
+        for pl in players:
+            heard = [h for h in pl.heard if h - pl.t_start > 3]   # after the starting point is taken
+            intervals.append((heard[-1] - heard[0]) / (len(heard) - 1))
+        return statuses, intervals
+
+    def test_drift_is_corrected_on_a_live_cast_speaker(self):
+        fast_nest = FakePlayer(ppm=20000)   # plays 2% fast: 20 ms a second
+        fake = FakeCast(self.tmp, fast_nest)
+        fake.start()
+        statuses, (interval,) = self._drift_run([self._cast_target(fake)], [fast_nest], 9)
+        self.assertIn("GET_STATUS", fake.events)
+        self.assertAlmostEqual(interval, 1.0, delta=0.006)   # uncorrected it would be 0.980
+        self.assertTrue(any("Nudged +" in s and "fast" in s for s in statuses), statuses)
+
+    def test_drift_is_corrected_on_a_live_dlna_speaker(self):
+        slow = FakePlayer(ppm=-20000)
+        fake = FakeDlna(player=slow, whole_seconds=False)
+        try:
+            statuses, (interval,) = self._drift_run([fake.target()], [slow], 9)
+        finally:
+            fake.close()
+        self.assertAlmostEqual(interval, 1.0, delta=0.006)   # uncorrected it would be 1.020
+        self.assertTrue(any("Nudged -" in s and "slow" in s for s in statuses), statuses)
+
+    def test_a_dlna_speaker_that_wont_say_where_it_is_is_left_alone(self):
+        fake = FakeDlna(reject="GetPositionInfo")
+        try:
+            from unittest import mock
+            with mock.patch.multiple(drift, DLNA_POLL_S=(0.05, 0.1), WARMUP_S=0.5):
+                statuses, failures = self._run([fake.target()], silence(), seconds=2)
+        finally:
+            fake.close()
+        self.assertEqual(failures, [])
+        self.assertTrue(any("doesn't report how far" in s for s in statuses), statuses)
+        polls = fake.actions.count("GetPositionInfo")
+        self.assertLess(polls, 20)   # it stops asking
 
     def test_one_speaker_failing_does_not_stop_the_others(self):
         cast_fake, bad = FakeCast(self.tmp), FakeDlna(reject="SetAVTransportURI")

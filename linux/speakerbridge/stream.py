@@ -11,17 +11,23 @@ from __future__ import annotations
 
 import math
 import queue
+import random
 import re
 import shutil
 import socket
 import struct
 import subprocess
+import sys
 import threading
 import time
+from array import array
+from bisect import bisect_right
+from collections import deque
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Callable, Iterable, Iterator
 
+from . import drift
 from .cast import NS_MEDIA, NS_RECEIVER, APP_ID, CastError, CastSession
 from .dlna import DlnaError, DlnaRenderer
 
@@ -30,6 +36,7 @@ SINK = "speakerbridge"
 CHUNK = RATE * CHANNELS * 2 // 50   # 20 ms of 16-bit audio
 BYTES_PER_MS = RATE * CHANNELS * 2 // 1000
 MAX_DELAY_MS = 3000
+FADE_FRAMES = RATE * 2 // 1000      # 2 ms fade either side of an insert or skip, so it doesn't click
 
 
 class StreamError(Exception):
@@ -170,6 +177,73 @@ class PipeWireCapture:
 
 
 # ------------------------------------------------------------ live HTTP stream
+def fade(b: bytes, out: bool) -> bytes:
+    """Fades the last (out) or first (in) FADE_FRAMES of 16-bit PCM."""
+    a = array("h", b)
+    if sys.byteorder == "big":
+        a.byteswap()
+    frames = len(a) // CHANNELS
+    n = min(FADE_FRAMES, frames)
+    for i in range(n):
+        g = (i + 1) / (n + 1)
+        f = frames - 1 - i if out else i
+        for c in range(CHANNELS):
+            a[f * CHANNELS + c] = int(a[f * CHANNELS + c] * g)
+    if sys.byteorder == "big":
+        a.byteswap()
+    return a.tobytes()
+
+
+class Timeline:
+    """What one speaker has been sent, so the play position it reports can be turned back
+    into the moment that audio was captured (see drift.py)."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._chunks: deque = deque(maxlen=1500)   # ~30 s of (media offset, capture time or None)
+        self._changes: deque = deque(maxlen=500)   # (media offset, total ms inserted - skipped so far)
+        self._nudge = 0
+        self.sent = 0                              # media bytes sent (after the WAV header)
+
+    def add(self, nbytes: int, captured: float | None) -> None:
+        with self._lock:
+            self._chunks.append((self.sent, captured))
+            self.sent += nbytes
+
+    def changed(self, ms: int) -> None:
+        """Records that `ms` of silence was inserted (+) or audio skipped (-) here."""
+        with self._lock:
+            total = self._changes[-1][1] if self._changes else 0
+            self._changes.append((self.sent, total + ms))
+
+    def nudge(self, ms: int) -> None:
+        """Asks the stream to insert (+) or skip (-) `ms` without changing the planned delay."""
+        with self._lock:
+            self._nudge += ms
+
+    def take_nudge(self) -> int:
+        with self._lock:
+            n, self._nudge = self._nudge, 0
+            return n
+
+    def capture_time(self, pos: int) -> float | None:
+        """When the audio at media byte `pos` was captured; None for silence or unknown."""
+        with self._lock:
+            chunks, sent = list(self._chunks), self.sent
+        i = bisect_right([c[0] for c in chunks], pos) - 1
+        if i < 0 or pos >= sent:
+            return None
+        off, ts = chunks[i]
+        return None if ts is None else ts + (pos - off) / (BYTES_PER_MS * 1000)
+
+    def changes_before(self, pos: int) -> int:
+        """Total ms inserted minus skipped before media byte `pos`."""
+        with self._lock:
+            changes = list(self._changes)
+        i = bisect_right([c[0] for c in changes], pos) - 1
+        return changes[i][1] if i >= 0 else 0
+
+
 class LiveServer:
     """Serves one live audio stream over HTTP on a LAN address; every listener gets 'now'.
 
@@ -177,7 +251,8 @@ class LiveServer:
     that plays early can wait for slower ones. A speaker starts playing once it has buffered
     a fixed amount and then keeps its own clock, so only holding audio back *before* it starts
     adds delay. A change mid-stream is made by inserting silence or skipping audio instead
-    (WAV only; for MP3 a new delay applies on the next stream).
+    (WAV only; for MP3 a new delay applies on the next stream). Each speaker's Timeline also
+    takes small drift corrections.
     """
 
     def __init__(self, source: Iterable[bytes], bind_ip: str, fmt: str = "wav",
@@ -188,6 +263,7 @@ class LiveServer:
         self._route = re.compile(rf"^(?:/(\d+))?{re.escape(self.path)}$")
         self._listeners: list[queue.Queue] = []
         self._lock = threading.Lock()
+        self.timelines: dict[int, Timeline] = {}   # latest connection of each speaker
         server = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -208,32 +284,48 @@ class LiveServer:
                         return 0
                 # ~5 s of audio beyond the longest delay
                 q: queue.Queue = queue.Queue(maxsize=250 + MAX_DELAY_MS // 20)
+                tl = Timeline()
                 with server._lock:
                     server._listeners.append(q)
+                    if n is not None:
+                        server.timelines[int(n)] = tl
+                wav = server.fmt == "wav"
                 try:
-                    if server.fmt == "wav":
+                    if wav:
                         self.wfile.write(wav_header())
-                    held, skip = delay(), 0
+                    held, skip, fade_in = delay(), 0, False
                     while True:
                         item = q.get()
                         if item is None:
                             return
                         captured, b = item
-                        want = delay()
-                        if want != held and server.fmt == "wav":
-                            if want > held:
-                                self.wfile.write(bytes((want - held) * BYTES_PER_MS))
-                            else:
-                                skip += (held - want) * BYTES_PER_MS
-                            held = want
                         if skip:
                             cut = min(skip, len(b))
-                            b, skip = b[cut:], skip - cut
+                            b, skip, captured = b[cut:], skip - cut, captured + cut / (BYTES_PER_MS * 1000)
                         wait = captured + held / 1000 - time.monotonic()
                         if wait > 0:
                             time.sleep(wait)
+                        # A new delay changes `held` too, so the speaker's buffer stays as full as it
+                        # was; a drift nudge changes only what is sent. Both apply after this chunk,
+                        # so the silence goes out before the next chunk is held back.
+                        want = delay() if wav else held
+                        change = want - held + (tl.take_nudge() if wav else 0)
                         if b:
+                            if fade_in:
+                                b, fade_in = fade(b, out=False), False
+                            if change:
+                                b = fade(b, out=True)
+                            tl.add(len(b), captured)
                             self.wfile.write(b)
+                        if change > 0:
+                            tl.add(change * BYTES_PER_MS, None)
+                            self.wfile.write(bytes(change * BYTES_PER_MS))
+                        elif change < 0:
+                            skip += -change * BYTES_PER_MS
+                        if change:
+                            tl.changed(change)
+                            fade_in = True
+                        held = want
                 except OSError:
                     pass   # the speaker disconnected
                 finally:
@@ -260,6 +352,10 @@ class LiveServer:
         self.url = f"http://{bind_ip}:{self.httpd.server_address[1]}{self.path}"
         threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
         threading.Thread(target=self._pump, args=(source,), daemon=True).start()
+
+    def timeline(self, n: int) -> Timeline | None:
+        with self._lock:
+            return self.timelines.get(n)
 
     def url_for(self, n: int) -> str:
         """The stream URL for speaker n, which gets delay_ms(n)."""
@@ -292,6 +388,18 @@ class LiveServer:
 TITLE = "This computer (SpeakerBridge)"
 
 
+@dataclass
+class _Link:
+    """Everything one speaker's player thread needs."""
+    target: Target
+    url: str
+    content_type: str
+    stop: threading.Event
+    say: Callable[[str], None]
+    heard: str                              # extra words for the "Streaming." message
+    monitor: drift.DriftMonitor | None      # None for MP3, which can't take corrections
+
+
 def run(targets: list[Target], stop: threading.Event, source: Iterable[bytes] | None = None,
         fmt: str = "wav", on_status=print) -> list[str]:
     """Streams to every target at once until `stop` is set or every speaker has stopped.
@@ -315,8 +423,11 @@ def run(targets: list[Target], stop: threading.Event, source: Iterable[bytes] | 
             try:
                 if local_ip_for(t.host) != bind_ip:
                     raise StreamError(f"it is on a different network from {targets[0].name}")
-                (_play_cast if t.protocol == "googlecast" else _play_dlna)(
-                    t, server.url_for(n), server.content_type, stop, lambda m: say(t, m), heard)
+                say_t = lambda m: say(t, m)   # noqa: E731
+                monitor = (drift.DriftMonitor(lambda: server.timeline(n), say_t, BYTES_PER_MS * 1000)
+                           if fmt == "wav" else None)
+                link = _Link(t, server.url_for(n), server.content_type, stop, say_t, heard, monitor)
+                (_play_cast if t.protocol == "googlecast" else _play_dlna)(link)
             except (StreamError, CastError, DlnaError, OSError) as exc:
                 if len(targets) == 1:
                     failures.append(str(exc))
@@ -344,13 +455,14 @@ def run(targets: list[Target], stop: threading.Event, source: Iterable[bytes] | 
     return failures
 
 
-def _play_cast(t: Target, url: str, content_type: str, stop: threading.Event, say, heard: str) -> None:
+def _play_cast(link: _Link) -> None:
+    t, say, mon = link.target, link.say, link.monitor
     say("Connecting to the speaker…")
     session = CastSession(t.host, t.port or 8009)
     try:
         session.launch()
-        session.load(url, content_type, TITLE, stream_type="LIVE", autoplay=True)
-        say("Streaming." + heard)
+        session.load(link.url, link.content_type, TITLE, stream_type="LIVE", autoplay=True)
+        say("Streaming." + link.heard)
 
         def ended(ns, p):
             if ns == NS_RECEIVER and p.get("type") == "RECEIVER_STATUS":
@@ -360,9 +472,15 @@ def _play_cast(t: Target, url: str, content_type: str, stop: threading.Event, sa
                 for st in p.get("status") or []:
                     if st.get("playerState") == "IDLE":
                         return True
+                    if mon and st.get("playerState") == "PLAYING" and "currentTime" in st:
+                        mon.sample(time.monotonic(), float(st["currentTime"]))
             return False
 
-        while not stop.is_set():
+        next_poll = 0.0
+        while not link.stop.is_set():
+            if mon and mon.enabled and time.monotonic() >= next_poll:
+                session.get_status()
+                next_poll = time.monotonic() + drift.CAST_POLL_S
             if session.wait(0.5, ended):
                 say("The speaker stopped the stream (it was stopped from elsewhere or "
                     "lost the connection).")
@@ -372,13 +490,25 @@ def _play_cast(t: Target, url: str, content_type: str, stop: threading.Event, sa
         session.close()
 
 
-def _play_dlna(t: Target, url: str, content_type: str, stop: threading.Event, say, heard: str) -> None:
+def _play_dlna(link: _Link) -> None:
+    say, mon = link.say, link.monitor
     say("Connecting to the speaker over DLNA…")
-    renderer = DlnaRenderer(t.location)
+    renderer = DlnaRenderer(link.target.location)
     try:
-        renderer.play(url, content_type, TITLE)
-        say("Streaming over DLNA." + heard)
-        stop.wait()
+        renderer.play(link.url, link.content_type, TITLE)
+        say("Streaming over DLNA." + link.heard)
+        started, answered = time.monotonic(), False
+        while not link.stop.wait(random.uniform(*drift.DLNA_POLL_S) if mon and mon.enabled else None):
+            t0 = time.monotonic()
+            pos = renderer.position()
+            t1 = time.monotonic()
+            if pos is not None:
+                answered = True
+                mon.sample((t0 + t1) / 2, pos[0], whole_seconds=pos[1], half_rtt=(t1 - t0) / 2)
+            elif not answered and t1 - started > drift.WARMUP_S:
+                mon.enabled = False
+                say("Can't keep this speaker in sync automatically: it doesn't report how far "
+                    "it has played.")
     finally:
         renderer.stop()
 

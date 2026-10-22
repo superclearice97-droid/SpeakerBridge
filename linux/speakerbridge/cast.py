@@ -209,6 +209,11 @@ class CastSession:
             raise CastError("the speaker didn't finish loading the audio")
         return state["s"]
 
+    def get_status(self) -> None:
+        """Asks for a MEDIA_STATUS (which carries currentTime); the answer arrives via wait()."""
+        self.send(self.transport_id, NS_MEDIA,
+                  {"type": "GET_STATUS", "requestId": None, "mediaSessionId": self.media_session_id})
+
     def play(self) -> None:
         self.send(self.transport_id, NS_MEDIA,
                   {"type": "PLAY", "requestId": None, "mediaSessionId": self.media_session_id})
