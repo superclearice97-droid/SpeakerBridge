@@ -10,7 +10,7 @@ try:
     from PySide6.QtGui import QAction, QColor
     from PySide6.QtWidgets import (
         QAbstractItemView, QApplication, QCheckBox, QFileDialog, QHBoxLayout, QHeaderView,
-        QLabel, QMainWindow, QMessageBox, QPushButton, QSplitter, QTableWidget,
+        QLabel, QMainWindow, QMessageBox, QPushButton, QSpinBox, QSplitter, QTableWidget,
         QTableWidgetItem, QTextBrowser, QToolBar, QVBoxLayout, QWidget,
     )
 except ImportError:  # pragma: no cover
@@ -50,15 +50,16 @@ class StreamWorker(QObject):
     status = Signal(str)
     done = Signal(str)
 
-    def __init__(self, targets: list):
+    def __init__(self, targets: list, source=None):
         super().__init__()
-        self.targets = targets
+        self.targets, self.source = targets, source
         self.stop = threading.Event()
 
     def run(self) -> None:
         try:
-            failures = stream.run(self.targets, self.stop, on_status=self.status.emit)
-            self.done.emit("Stream stopped. Audio is back on this computer."
+            failures = stream.run(self.targets, self.stop, source=self.source, on_status=self.status.emit)
+            self.done.emit(("Sync clicks stopped." if self.source else
+                            "Stream stopped. Audio is back on this computer.")
                            + (f" Not played on: {'; '.join(failures)}" if failures else ""))
         except Exception as exc:
             self.done.emit(f"Couldn't stream: {exc}")
@@ -112,6 +113,19 @@ class MainWindow(QMainWindow):
         self.stream_btn.setEnabled(False)
         self.stream_thread: QThread | None = None
         self.stream_worker: StreamWorker | None = None
+        self.clicks_box = QCheckBox("Play sync clicks")
+        self.clicks_box.setToolTip("Stream a click once a second instead of this computer's audio, to line "
+                                   "speakers in one room up by ear: raise the sync delay of the speaker that "
+                                   "clicks first until you hear a single click.")
+        self.delay_box = QSpinBox()
+        self.delay_box.setRange(0, stream.MAX_DELAY_MS)
+        self.delay_box.setSingleStep(25)
+        self.delay_box.setSuffix(" ms")
+        self.delay_box.setPrefix("Sync delay ")
+        self.delay_box.setToolTip("Holds this speaker back so it lines up with slower ones. Saved, and "
+                                  "changes apply straight away while streaming.")
+        self.delay_box.setEnabled(False)
+        self.delay_box.valueChanged.connect(self.delay_changed)
 
         right = QWidget()
         rl = QVBoxLayout(right)
@@ -119,6 +133,8 @@ class MainWindow(QMainWindow):
         rl.addWidget(self.details)
         row = QHBoxLayout()
         row.addStretch(1)
+        row.addWidget(self.delay_box)
+        row.addWidget(self.clicks_box)
         row.addWidget(self.stream_btn)
         row.addWidget(self.verify_btn)
         rl.addLayout(row)
@@ -217,6 +233,10 @@ class MainWindow(QMainWindow):
     def show_details(self) -> None:
         d = self.selected()
         self.stream_btn.setEnabled(self.stream_worker is not None or bool(self.streamable_selection()))
+        self.delay_box.blockSignals(True)
+        self.delay_box.setValue(store.delays().get(d.key, 0) if d else 0)
+        self.delay_box.blockSignals(False)
+        self.delay_box.setEnabled(d is not None and stream.target_for(d) is not None)
         if d is None:
             return
         label = compat.load()["status_labels"].get(d.status, d.status)
@@ -231,6 +251,15 @@ class MainWindow(QMainWindow):
         self.verify_btn.setEnabled(d.status != "not_speaker")
         self.verify_btn.setText("Remove verified mark" if d.status == "verified"
                                 else "Mark playback verified")
+
+    def delay_changed(self, ms: int) -> None:
+        d = self.selected()
+        if d is None:
+            return
+        store.save_delay(d.key, ms)
+        for t in self.stream_worker.targets if self.stream_worker else []:
+            if t.key == d.key:
+                t.delay_ms = ms   # the stream picks this up within 20 ms
 
     def toggle_verified(self) -> None:
         d = self.selected()
@@ -252,13 +281,17 @@ class MainWindow(QMainWindow):
         targets = self.streamable_selection()
         if not targets:
             return
+        saved = store.delays()
+        for t in targets:
+            t.delay_ms = saved.get(t.key, 0)
         self.stream_thread = QThread(self)
-        self.stream_worker = StreamWorker(targets)
+        self.stream_worker = StreamWorker(targets, stream.clicks() if self.clicks_box.isChecked() else None)
         self.stream_worker.moveToThread(self.stream_thread)
         self.stream_thread.started.connect(self.stream_worker.run)
         self.stream_worker.status.connect(self.statusBar().showMessage)
         self.stream_worker.done.connect(self.stream_done)
         self.stream_btn.setText(f"Stop streaming to {', '.join(t.name for t in targets)}")
+        self.clicks_box.setEnabled(False)
         self.stream_thread.start()
 
     def stream_done(self, msg: str) -> None:
@@ -267,6 +300,7 @@ class MainWindow(QMainWindow):
             self.stream_thread.wait()
         self.stream_thread = self.stream_worker = None
         self.stream_btn.setText("Stream this computer's audio here")
+        self.clicks_box.setEnabled(True)
         self.stream_btn.setEnabled(bool(self.streamable_selection()))
         self.statusBar().showMessage(msg)
 

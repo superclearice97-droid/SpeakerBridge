@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 
 from . import __version__, compat, scanner, store
@@ -109,6 +110,9 @@ def stream_main(argv: list[str] | None = None) -> int:
     ap.add_argument("--format", choices=["wav", "mp3"], default="wav",
                     help="wav (default, lossless) or mp3 (needs ffmpeg; try it if wav won't play)")
     ap.add_argument("--timeout", type=float, default=4.0, help="seconds to scan (default 4)")
+    ap.add_argument("--calibrate", action="store_true",
+                    help="play clicks on the speakers and line them up by ear; the delays are saved "
+                         "and used every time you stream to them")
     args = ap.parse_args(argv)
 
     import threading
@@ -132,7 +136,14 @@ def stream_main(argv: list[str] | None = None) -> int:
         return 1
 
     targets = [stream.target_for(d) for d in chosen]
-    names = ", ".join(f"{t.name} ({t.host})" for t in targets)
+    saved = store.delays()
+    for t in targets:
+        t.delay_ms = saved.get(t.key, 0)
+    if args.calibrate:
+        return calibrate(targets)
+
+    names = ", ".join(f"{t.name} ({t.host}{f', sync delay {t.delay_ms} ms' if t.delay_ms else ''})"
+                      for t in targets)
     print(f"Streaming to {names}. Press Ctrl+C to stop.")
     print("Note: speakers buffer a second or two, so this suits music, not lip-synced video yet.")
     stop = threading.Event()
@@ -145,6 +156,76 @@ def stream_main(argv: list[str] | None = None) -> int:
         print(f"Couldn't stream: {exc}", file=sys.stderr)
         return 1
     return 1 if failures else 0
+
+
+CALIBRATE_HELP = """\
+Playing a click once a second on every speaker (each one takes a few seconds to start).
+Stand where you will listen. Two clicks close together mean the speakers are out of line:
+add delay to the speaker that clicks FIRST until you hear one click. Not sure which is
+first? Add 100 ms to one; if the gap gets wider, take it off again and add it to the other.
+
+  "2 +50"  adds 50 ms to speaker 2     "2 -50"  takes 50 ms off     "2 =400"  sets it
+  Enter shows the delays.  "q" saves and stops.  Ctrl+C stops without saving."""
+
+
+def delays_text(targets) -> str:
+    return "\n".join(f"  {n}  {t.name:<28} {t.delay_ms:>5} ms" for n, t in enumerate(targets, 1))
+
+
+def apply_command(line: str, targets) -> str:
+    """Handles one calibration command ("2 +50", "2 -50", "2 =400"); returns what to print."""
+    from .stream import MAX_DELAY_MS
+    if not line.strip():
+        return delays_text(targets)
+    m = re.fullmatch(r"\s*(\d+)\s*([-+=])\s*(\d+)\s*(?:ms)?\s*", line)
+    if not m or not 1 <= int(m[1]) <= len(targets):
+        return f'Type a speaker number (1-{len(targets)}) and a change, e.g. "2 +50", "2 -50" or "2 =400".'
+    t, v = targets[int(m[1]) - 1], int(m[3])
+    new = v if m[2] == "=" else t.delay_ms + (v if m[2] == "+" else -v)
+    t.delay_ms = max(0, min(MAX_DELAY_MS, new))
+    return f"  {t.name}: {t.delay_ms} ms"
+
+
+def calibrate(targets) -> int:
+    import threading
+    from . import stream
+    if len(targets) < 2:
+        print("Calibration lines speakers up with each other: name at least two.", file=sys.stderr)
+        return 1
+    stop, result = threading.Event(), {}
+
+    def play():
+        try:
+            result["failures"] = stream.run(targets, stop, source=stream.clicks(),
+                                            on_status=lambda m: print(f"  ({m})"))
+        except stream.StreamError as exc:
+            result["error"] = exc
+
+    th = threading.Thread(target=play, daemon=True)
+    th.start()
+    print(CALIBRATE_HELP)
+    print(delays_text(targets))
+    try:
+        while th.is_alive():
+            line = input("> ")
+            if line.strip().lower() in ("q", "quit"):
+                break
+            print(apply_command(line, targets))
+    except (EOFError, KeyboardInterrupt):
+        stop.set()
+        th.join()
+        print("\nStopped. Delays not saved.")
+        return 1
+    stop.set()
+    th.join()
+    if "error" in result:
+        print(f"Couldn't play the clicks: {result['error']}", file=sys.stderr)
+        return 1
+    for t in targets:
+        store.save_delay(t.key, t.delay_ms)
+    print("Saved. These delays are used every time you stream to these speakers:")
+    print(delays_text(targets))
+    return 0
 
 
 def _print_streamable(devices, out) -> None:

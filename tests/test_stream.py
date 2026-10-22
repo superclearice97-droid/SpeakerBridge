@@ -23,7 +23,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "linux"))
 
-from speakerbridge import cast, cli, dlna, stream  # noqa: E402
+from speakerbridge import cast, cli, dlna, store, stream  # noqa: E402
 from speakerbridge.model import Device, ProtocolHit  # noqa: E402
 
 
@@ -51,17 +51,118 @@ def silence():
         time.sleep(0.02)
 
 
+def numbered():
+    """Chunk i is filled with the 32-bit number i (from 1), so a reader can tell which
+    chunks arrived, which were skipped and where silence (0) was inserted."""
+    i = 1
+    while True:
+        yield struct.pack("<I", i) * (stream.CHUNK // 4)
+        i += 1
+        time.sleep(0.02)
+
+
+def frames(r, n_bytes):
+    data = r.read(n_bytes)
+    return [struct.unpack_from("<I", data, k)[0] for k in range(0, len(data) - 3, 4)]
+
+
+def runs(values):
+    """[(value, count), ...] of consecutive equal values."""
+    out = []
+    for v in values:
+        if out and out[-1][0] == v:
+            out[-1][1] += 1
+        else:
+            out.append([v, 1])
+    return [tuple(x) for x in out]
+
+
+OPEN = urllib.request.build_opener(urllib.request.ProxyHandler({})).open
+
+
 class LiveServerTest(unittest.TestCase):
     def test_listener_gets_header_then_audio(self):
         srv = stream.LiveServer(silence(), "127.0.0.1")
         try:
-            with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(srv.url, timeout=5) as r:
+            with OPEN(srv.url, timeout=5) as r:
                 self.assertEqual(r.headers["Content-Type"], "audio/wav")
                 data = r.read(44 + stream.CHUNK * 3)
             self.assertEqual(data[:4], b"RIFF")
             self.assertEqual(len(data), 44 + stream.CHUNK * 3)
         finally:
             srv.close()
+
+    def test_unknown_paths_are_refused(self):
+        srv = stream.LiveServer(silence(), "127.0.0.1")
+        try:
+            for bad in ("/x/speakerbridge.wav", "/speakerbridge.mp3", "/0/../etc/passwd"):
+                with self.assertRaises(urllib.error.HTTPError, msg=bad):
+                    OPEN(srv.url.replace("/speakerbridge.wav", bad), timeout=5)
+        finally:
+            srv.close()
+
+    def test_unknown_speaker_numbers_still_get_the_stream(self):
+        targets = [stream.Target("Only", "googlecast", "127.0.0.1", delay_ms=50)]
+        srv = stream.LiveServer(silence(), "127.0.0.1", delay_ms=lambda n: targets[n].delay_ms)
+        try:
+            with OPEN(srv.url_for(99), timeout=5) as r:
+                self.assertEqual(len(r.read(44 + stream.CHUNK)), 44 + stream.CHUNK)
+        finally:
+            srv.close()
+
+    def test_delay_holds_audio_back_from_the_start(self):
+        delays = {0: 0, 1: 300}
+        srv = stream.LiveServer(silence(), "127.0.0.1", delay_ms=delays.get)
+        try:
+            for n, low, high in ((0, 0.0, 0.2), (1, 0.3, 0.6)):
+                with OPEN(srv.url_for(n), timeout=5) as r:
+                    r.read(44)
+                    t0 = time.monotonic()
+                    r.read(stream.CHUNK)
+                    self.assertTrue(low <= time.monotonic() - t0 < high, (n, time.monotonic() - t0))
+        finally:
+            srv.close()
+
+    def test_raising_the_delay_mid_stream_inserts_silence(self):
+        delays = {0: 0}
+        srv = stream.LiveServer(numbered(), "127.0.0.1", delay_ms=delays.get)
+        try:
+            with OPEN(srv.url_for(0), timeout=5) as r:
+                r.read(44)
+                before = frames(r, stream.CHUNK * 5)
+                delays[0] = 100
+                after = frames(r, stream.CHUNK * 10)
+        finally:
+            srv.close()
+        self.assertNotIn(0, before)
+        r_after = runs(after)
+        silences = [c for v, c in r_after if v == 0]
+        self.assertEqual(silences, [100 * stream.BYTES_PER_MS // 4])   # exactly 100 ms, once
+        audio = [v for v in before + after if v]
+        self.assertEqual(sorted(set(audio)), list(range(min(audio), max(audio) + 1)))   # nothing skipped
+
+    def test_lowering_the_delay_mid_stream_skips_audio(self):
+        delays = {0: 200}
+        srv = stream.LiveServer(numbered(), "127.0.0.1", delay_ms=delays.get)
+        try:
+            with OPEN(srv.url_for(0), timeout=5) as r:
+                r.read(44)
+                before = frames(r, stream.CHUNK * 3)
+                delays[0] = 100
+                after = frames(r, stream.CHUNK * 10)
+        finally:
+            srv.close()
+        self.assertNotIn(0, before + after)
+        seen = sorted(set(before + after))
+        missing = [i for i in range(seen[0], seen[-1]) if i not in seen]
+        self.assertEqual(len(missing), 100 // 20)   # 100 ms = 5 chunks skipped, no silence added
+
+    def test_click_track(self):
+        import itertools
+        first, second = itertools.islice(stream.clicks(), 2)
+        self.assertEqual((len(first), len(second)), (stream.CHUNK, stream.CHUNK))
+        self.assertTrue(any(first))
+        self.assertFalse(any(second))
 
 
 # ------------------------------------------------------------ fake Cast speaker
@@ -218,6 +319,36 @@ class TargetTests(unittest.TestCase):
         self.assertIsNone(cli.find_target(devs, "sonos")[0])
 
 
+class CalibrationTests(unittest.TestCase):
+    def test_commands_change_one_speakers_delay_within_limits(self):
+        ts = [stream.Target("Nest", "googlecast", "h"), stream.Target("HEOS", "dlna_renderer", "h")]
+        cli.apply_command("2 +50", ts)
+        cli.apply_command("2+25ms", ts)
+        self.assertEqual([t.delay_ms for t in ts], [0, 75])
+        cli.apply_command("2 -500", ts)
+        cli.apply_command("1 =99999", ts)
+        self.assertEqual([t.delay_ms for t in ts], [stream.MAX_DELAY_MS, 0])
+        self.assertIn("speaker number", cli.apply_command("3 +50", ts))
+        self.assertIn("speaker number", cli.apply_command("louder", ts))
+        self.assertIn("HEOS", cli.apply_command("", ts))
+
+    def test_delays_are_saved_per_speaker(self):
+        old = os.environ.get("XDG_CONFIG_HOME")
+        os.environ["XDG_CONFIG_HOME"] = tempfile.mkdtemp()
+        try:
+            store.save_delay("googlecast:abc", 250)
+            store.save_delay("dlna_renderer:uuid:1", 0)
+            self.assertEqual(store.delays(), {"googlecast:abc": 250})
+            store.save_delay("googlecast:abc", 0)
+            self.assertEqual(store.delays(), {})
+            self.assertEqual(store.verified_keys(), set())   # separate from verified records
+        finally:
+            if old is None:
+                del os.environ["XDG_CONFIG_HOME"]
+            else:
+                os.environ["XDG_CONFIG_HOME"] = old
+
+
 @unittest.skipUnless(shutil.which("openssl"), "needs openssl to make a test certificate")
 class StreamEndToEnd(unittest.TestCase):
     @classmethod
@@ -271,12 +402,15 @@ esac
             (bindir / f).chmod((bindir / f).stat().st_mode | stat.S_IEXEC)
         old = os.environ["PATH"]
         os.environ["PATH"] = f"{bindir}:{old}"
+        fake, dlna_fake = FakeCast(self.tmp), FakeDlna()
         try:
-            fake = FakeCast(self.tmp)
             fake.start()
-            self._run([self._cast_target(fake)], None)
+            statuses, _ = self._run([self._cast_target(fake), dlna_fake.target()], None)
         finally:
             os.environ["PATH"] = old
+            dlna_fake.close()
+        self.assertTrue(any("buffer differently" in s for s in statuses))
+        self.assertTrue(any("Fake Denon: Streaming over DLNA. Anything this computer plays" in s for s in statuses))
         calls = log.read_text().splitlines()
         self.assertIn("set-default-sink speakerbridge", calls)
         self.assertIn("move-sink-input 7 speakerbridge", calls)
@@ -306,12 +440,25 @@ esac
         self.assertEqual(failures, [])
         self.assertEqual(cast_fake.fetched[:4], b"RIFF")
         self.assertEqual(dlna_fake.fetched[:4], b"RIFF")
-        self.assertEqual(cast_fake.load["media"]["contentId"], dlna_fake.uri)   # one shared stream
+        cast_url, dlna_url = cast_fake.load["media"]["contentId"], dlna_fake.uri
+        self.assertEqual(cast_url.replace("/0/", "/1/"), dlna_url)   # one server, a URL (and delay) each
         self.assertIn("STOP", cast_fake.events)
         self.assertEqual(dlna_fake.actions[-1], "Stop")
         self.assertTrue(any(s.startswith("Fake Nest: Streaming") for s in statuses))
         self.assertTrue(any(s.startswith("Fake Denon: Streaming") for s in statuses))
-        self.assertTrue(any("buffer differently" in s for s in statuses))
+        self.assertFalse(any("buffer differently" in s for s in statuses))   # only for computer audio
+
+    def test_saved_delay_reaches_the_right_speaker(self):
+        cast_fake, dlna_fake = FakeCast(self.tmp), FakeDlna()
+        cast_fake.start()
+        nest, heos = self._cast_target(cast_fake), dlna_fake.target()
+        heos.delay_ms = 400
+        try:
+            statuses, _ = self._run([nest, heos], silence())
+        finally:
+            dlna_fake.close()
+        self.assertIn("/0/", cast_fake.load["media"]["contentId"])
+        self.assertIn("/1/", dlna_fake.uri)
 
     def test_one_speaker_failing_does_not_stop_the_others(self):
         cast_fake, bad = FakeCast(self.tmp), FakeDlna(reject="SetAVTransportURI")

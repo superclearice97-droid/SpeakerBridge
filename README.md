@@ -31,7 +31,17 @@ Or select speakers in the desktop app (Ctrl+click to pick several) and press **S
 
 Each speaker gets the same stream over whichever protocol it speaks: **Google Cast** (Nest, Chromecast built-in Sony / Vizio / JBL and others, Google Home speaker groups and stereo pairs) or **DLNA / UPnP** (many Denon/HEOS, Yamaha MusicCast, LG, Samsung and older Sony speakers). If a speaker offers both, Cast is used. If one speaker can't play, the others keep going. The stream stays on your local network.
 
-Sync, honestly: every speaker buffers a second or two, so this suits music rather than lip-synced video. Speakers inside one Google Home group stay tightly in sync. Separate speakers, especially Cast and DLNA ones mixed, can be up to a second or two apart. That's fine for different rooms; in one room you'll hear an echo. Fixing that is the 0.4 sync engine. Until then, for one room, put the Cast speakers into a Google Home group and stream to the group.
+Sync, honestly: every speaker buffers a second or two, so this suits music rather than lip-synced video. Speakers inside one Google Home group stay tightly in sync. Separate speakers, especially Cast and DLNA ones mixed, start out up to a second or two apart. That's fine for different rooms; in one room you'll hear an echo until you line them up.
+
+**Lining speakers up in one room (sync delay):**
+
+```bash
+speakerbridge-stream --calibrate "Kitchen Nest" "Den HEOS"
+```
+
+Every speaker plays a click once a second. If you hear two clicks close together, add delay to the speaker that clicks first (`1 +50`, `1 -25`, `1 =400`) until you hear one click, then type `q` to save. In the desktop app, select the speakers, tick **Play sync clicks**, press Stream, and adjust each speaker's **Sync delay** box. Changes apply while it plays. Delays (0–3000 ms) are saved per speaker in `~/.config/speakerbridge/delays.json` and used every time you stream to that speaker. Nothing is recorded; you line them up by ear.
+
+Good to know: a speaker can only be held back, not sped up, so the slowest speaker stays at 0. Each speaker's clock runs very slightly differently, so over a long session they can drift apart a little; stopping and starting the stream lines them up again. With `--format mp3`, a delay changed mid-stream takes effect on the next stream.
 
 Without installing, from the repo: `cd linux && python3 -m speakerbridge` (GUI) or `python3 -m speakerbridge scan`.
 
@@ -91,7 +101,7 @@ The scanner flags this when it sees a non-Google speaker with Cast ("can join a 
 | 0.1 | Discovery on Linux + Android, shared compatibility database | **Done** |
 | 0.2 | Linux → Google Cast (single speakers and Cast groups) via an HTTP stream of PipeWire audio; AirPlay (RAOP) via PipeWire's built-in module | Cast streaming done; AirPlay next |
 | 0.3 | Multiple targets at once, saved groups, per-speaker volume | Linux: Cast + DLNA speakers at once done; saved groups and volume next |
-| 0.4 | Sync engine: delay calibration for DLNA / mixed targets, drift monitoring | |
+| 0.4 | Sync engine: delay calibration for DLNA / mixed targets, drift monitoring | Linux: per-speaker sync delay, calibrated by ear, done; drift monitoring next |
 | 0.5 | Android as an audio source (AudioPlaybackCapture, with your consent) | |
 | 0.6 | Sony / Vizio control APIs for volume and input, more DLNA devices | |
 | 1.0 | Stable release, APK + Linux package, docs | |

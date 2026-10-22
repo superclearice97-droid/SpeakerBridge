@@ -9,15 +9,18 @@ How it works:
 """
 from __future__ import annotations
 
+import math
 import queue
+import re
 import shutil
 import socket
 import struct
 import subprocess
 import threading
+import time
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Iterable, Iterator
+from typing import Callable, Iterable, Iterator
 
 from .cast import NS_MEDIA, NS_RECEIVER, APP_ID, CastError, CastSession
 from .dlna import DlnaError, DlnaRenderer
@@ -25,6 +28,8 @@ from .dlna import DlnaError, DlnaRenderer
 RATE, CHANNELS = 48000, 2
 SINK = "speakerbridge"
 CHUNK = RATE * CHANNELS * 2 // 50   # 20 ms of 16-bit audio
+BYTES_PER_MS = RATE * CHANNELS * 2 // 1000
+MAX_DELAY_MS = 3000
 
 
 class StreamError(Exception):
@@ -39,6 +44,8 @@ class Target:
     host: str
     port: int = 0        # Cast
     location: str = ""   # DLNA description URL
+    key: str = ""        # Device.key, for saving this speaker's delay
+    delay_ms: int = 0    # sync delay; may be changed while streaming
 
 
 def target_for(dev) -> Target | None:
@@ -46,10 +53,10 @@ def target_for(dev) -> Target | None:
     stereo pairs in sync), else DLNA. None when it offers neither."""
     cast = dev.protocols.get("googlecast")
     if cast:
-        return Target(dev.name, "googlecast", dev.ip, port=cast.port or 8009)
+        return Target(dev.name, "googlecast", dev.ip, port=cast.port or 8009, key=dev.key)
     dlna = dev.protocols.get("dlna_renderer")
     if dlna and dlna.details.get("location"):
-        return Target(dev.name, "dlna_renderer", dev.ip, location=dlna.details["location"])
+        return Target(dev.name, "dlna_renderer", dev.ip, location=dlna.details["location"], key=dev.key)
     return None
 
 
@@ -58,6 +65,20 @@ def wav_header(rate: int = RATE, channels: int = CHANNELS) -> bytes:
     return (b"RIFF" + struct.pack("<I", 0xFFFFFFFF) + b"WAVEfmt " +
             struct.pack("<IHHIIHH", 16, 1, channels, rate, rate * channels * 2, channels * 2, 16) +
             b"data" + struct.pack("<I", 0xFFFFFFFF))
+
+
+def clicks() -> Iterator[bytes]:
+    """A short click once a second, paced in real time, for lining speakers up by ear."""
+    click = bytearray()
+    for i in range(RATE // 100):   # 10 ms, 1.5 kHz, fading out
+        v = int(20000 * math.sin(2 * math.pi * 1500 * i / RATE) * (1 - i / (RATE // 100)))
+        click += struct.pack("<hh", v, v)
+    period = [bytes(click) + bytes(CHUNK - len(click))] + [bytes(CHUNK)] * 49
+    start, n = time.monotonic(), 0
+    while True:
+        yield period[n % 50]
+        n += 1
+        time.sleep(max(0.0, start + n * 0.02 - time.monotonic()))
 
 
 def local_ip_for(target_ip: str) -> str:
@@ -150,12 +171,21 @@ class PipeWireCapture:
 
 # ------------------------------------------------------------ live HTTP stream
 class LiveServer:
-    """Serves one live audio stream over HTTP on a LAN address; every listener gets 'now'."""
+    """Serves one live audio stream over HTTP on a LAN address; every listener gets 'now'.
 
-    def __init__(self, source: Iterable[bytes], bind_ip: str, fmt: str = "wav"):
+    Speaker N fetches /N/speakerbridge.wav and hears it delay_ms(N) later, so a speaker
+    that plays early can wait for slower ones. A speaker starts playing once it has buffered
+    a fixed amount and then keeps its own clock, so only holding audio back *before* it starts
+    adds delay. A change mid-stream is made by inserting silence or skipping audio instead
+    (WAV only; for MP3 a new delay applies on the next stream).
+    """
+
+    def __init__(self, source: Iterable[bytes], bind_ip: str, fmt: str = "wav",
+                 delay_ms: Callable[[int], int] = lambda i: 0):
         self.fmt = fmt
         self.content_type = "audio/wav" if fmt == "wav" else "audio/mpeg"
         self.path = f"/speakerbridge.{fmt}"
+        self._route = re.compile(rf"^(?:/(\d+))?{re.escape(self.path)}$")
         self._listeners: list[queue.Queue] = []
         self._lock = threading.Lock()
         server = self
@@ -169,17 +199,41 @@ class LiveServer:
             def do_GET(self):
                 if not self._headers():
                     return
-                q: queue.Queue = queue.Queue(maxsize=250)   # ~5 s of audio
+                n = server._route.match(self.path.split("?")[0]).group(1)
+
+                def delay() -> int:
+                    try:   # any LAN device can ask for any number; unknown ones get no delay
+                        return 0 if n is None else max(0, min(MAX_DELAY_MS, int(delay_ms(int(n)))))
+                    except (IndexError, KeyError, TypeError, ValueError):
+                        return 0
+                # ~5 s of audio beyond the longest delay
+                q: queue.Queue = queue.Queue(maxsize=250 + MAX_DELAY_MS // 20)
                 with server._lock:
                     server._listeners.append(q)
                 try:
                     if server.fmt == "wav":
                         self.wfile.write(wav_header())
+                    held, skip = delay(), 0
                     while True:
-                        b = q.get()
-                        if b is None:
+                        item = q.get()
+                        if item is None:
                             return
-                        self.wfile.write(b)
+                        captured, b = item
+                        want = delay()
+                        if want != held and server.fmt == "wav":
+                            if want > held:
+                                self.wfile.write(bytes((want - held) * BYTES_PER_MS))
+                            else:
+                                skip += (held - want) * BYTES_PER_MS
+                            held = want
+                        if skip:
+                            cut = min(skip, len(b))
+                            b, skip = b[cut:], skip - cut
+                        wait = captured + held / 1000 - time.monotonic()
+                        if wait > 0:
+                            time.sleep(wait)
+                        if b:
+                            self.wfile.write(b)
                 except OSError:
                     pass   # the speaker disconnected
                 finally:
@@ -188,7 +242,7 @@ class LiveServer:
                             server._listeners.remove(q)
 
             def _headers(self) -> bool:
-                if self.path.split("?")[0] != server.path:
+                if not server._route.match(self.path.split("?")[0]):
                     self.send_error(404)
                     return False
                 self.send_response(200)
@@ -207,12 +261,17 @@ class LiveServer:
         threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
         threading.Thread(target=self._pump, args=(source,), daemon=True).start()
 
+    def url_for(self, n: int) -> str:
+        """The stream URL for speaker n, which gets delay_ms(n)."""
+        return self.url.replace(self.path, f"/{n}{self.path}", 1)
+
     def _pump(self, source: Iterable[bytes]) -> None:
         for b in source:
+            item = (time.monotonic(), b)
             with self._lock:
                 for q in list(self._listeners):
                     try:
-                        q.put_nowait(b)
+                        q.put_nowait(item)
                     except queue.Full:      # a listener that fell far behind gets cut off
                         try:
                             q.get_nowait()
@@ -245,14 +304,19 @@ def run(targets: list[Target], stop: threading.Event, source: Iterable[bytes] | 
     failures: list[str] = []
 
     capture = PipeWireCapture(fmt) if source is None else None
+    # Only true when it's this computer's audio (not the sync clicks or a test source).
+    heard = (" Anything this computer plays now comes out of the speaker. Stop to switch audio back."
+             if capture else "")
     with (capture if capture else _nullctx()):
-        server = LiveServer(capture.chunks() if capture else source, bind_ip, fmt)
+        server = LiveServer(capture.chunks() if capture else source, bind_ip, fmt,
+                            delay_ms=lambda n: targets[n].delay_ms)
 
-        def play(t: Target) -> None:
+        def play(n: int, t: Target) -> None:
             try:
                 if local_ip_for(t.host) != bind_ip:
                     raise StreamError(f"it is on a different network from {targets[0].name}")
-                (_play_cast if t.protocol == "googlecast" else _play_dlna)(t, server, stop, lambda m: say(t, m))
+                (_play_cast if t.protocol == "googlecast" else _play_dlna)(
+                    t, server.url_for(n), server.content_type, stop, lambda m: say(t, m), heard)
             except (StreamError, CastError, DlnaError, OSError) as exc:
                 if len(targets) == 1:
                     failures.append(str(exc))
@@ -260,10 +324,11 @@ def run(targets: list[Target], stop: threading.Event, source: Iterable[bytes] | 
                     failures.append(f"{t.name}: {exc}")
                     say(t, f"Couldn't stream: {exc}. The other speakers carry on.")
 
-        if len({t.protocol for t in targets}) > 1:
+        if capture and len({t.protocol for t in targets}) > 1 and not any(t.delay_ms for t in targets):
             on_status("Note: Cast and DLNA speakers buffer differently, so they can be a second "
-                      "or two apart. Fine for different rooms; in one room it will echo.")
-        threads = [threading.Thread(target=play, args=(t,), daemon=True) for t in targets]
+                      "or two apart. Fine for different rooms; for one room, line them up with "
+                      "sync clicks first.")
+        threads = [threading.Thread(target=play, args=(n, t), daemon=True) for n, t in enumerate(targets)]
         try:
             for th in threads:
                 th.start()
@@ -279,14 +344,13 @@ def run(targets: list[Target], stop: threading.Event, source: Iterable[bytes] | 
     return failures
 
 
-def _play_cast(t: Target, server: LiveServer, stop: threading.Event, say) -> None:
+def _play_cast(t: Target, url: str, content_type: str, stop: threading.Event, say, heard: str) -> None:
     say("Connecting to the speaker…")
     session = CastSession(t.host, t.port or 8009)
     try:
         session.launch()
-        session.load(server.url, server.content_type, TITLE, stream_type="LIVE", autoplay=True)
-        say("Streaming. Anything this computer plays now comes out of the speaker. "
-            "Stop to switch audio back.")
+        session.load(url, content_type, TITLE, stream_type="LIVE", autoplay=True)
+        say("Streaming." + heard)
 
         def ended(ns, p):
             if ns == NS_RECEIVER and p.get("type") == "RECEIVER_STATUS":
@@ -308,13 +372,12 @@ def _play_cast(t: Target, server: LiveServer, stop: threading.Event, say) -> Non
         session.close()
 
 
-def _play_dlna(t: Target, server: LiveServer, stop: threading.Event, say) -> None:
+def _play_dlna(t: Target, url: str, content_type: str, stop: threading.Event, say, heard: str) -> None:
     say("Connecting to the speaker over DLNA…")
     renderer = DlnaRenderer(t.location)
     try:
-        renderer.play(server.url, server.content_type, TITLE)
-        say("Streaming over DLNA. Anything this computer plays now comes out of the speaker. "
-            "Stop to switch audio back.")
+        renderer.play(url, content_type, TITLE)
+        say("Streaming over DLNA." + heard)
         stop.wait()
     finally:
         renderer.stop()
