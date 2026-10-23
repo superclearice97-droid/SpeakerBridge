@@ -8,7 +8,9 @@ How it works:
 """
 from __future__ import annotations
 
+import hmac
 import queue
+import secrets
 import shutil
 import socket
 import struct
@@ -130,7 +132,9 @@ class LiveServer:
     def __init__(self, source: Iterable[bytes], bind_ip: str, fmt: str = "wav"):
         self.fmt = fmt
         self.content_type = "audio/wav" if fmt == "wav" else "audio/mpeg"
-        self.path = f"/speakerbridge.{fmt}"
+        # The stream is everything this computer plays, served over plain HTTP because Cast speakers fetch it
+        # that way. An unguessable path keeps other devices on the network from simply connecting to it.
+        self.path = f"/{secrets.token_urlsafe(16)}/speakerbridge.{fmt}"
         self._listeners: list[queue.Queue] = []
         self._lock = threading.Lock()
         server = self
@@ -163,7 +167,7 @@ class LiveServer:
                             server._listeners.remove(q)
 
             def _headers(self) -> bool:
-                if self.path.split("?")[0] != server.path:
+                if not hmac.compare_digest(self.path.split("?")[0].encode(), server.path.encode()):
                     self.send_error(404)
                     return False
                 self.send_response(200)

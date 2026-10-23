@@ -16,6 +16,7 @@ import tempfile
 import threading
 import time
 import unittest
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -58,6 +59,41 @@ class LiveServerTest(unittest.TestCase):
                 data = r.read(44 + stream.CHUNK * 3)
             self.assertEqual(data[:4], b"RIFF")
             self.assertEqual(len(data), 44 + stream.CHUNK * 3)
+        finally:
+            srv.close()
+
+
+class LiveServerAccessTest(unittest.TestCase):
+    """The stream carries everything the computer plays, so its address must not be guessable."""
+
+    def _status(self, url):
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        try:
+            with opener.open(url, timeout=5) as r:
+                return r.status
+        except urllib.error.HTTPError as e:
+            return e.code
+
+    def test_url_contains_an_unguessable_token(self):
+        a = stream.LiveServer(silence(), "127.0.0.1")
+        b = stream.LiveServer(silence(), "127.0.0.1")
+        try:
+            token_a = a.url.split("/")[-2]
+            self.assertGreaterEqual(len(token_a), 20)
+            self.assertNotEqual(a.url.split("/")[-2], b.url.split("/")[-2])
+            self.assertTrue(a.url.endswith("/speakerbridge.wav"))
+        finally:
+            a.close()
+            b.close()
+
+    def test_requests_without_the_token_are_refused(self):
+        srv = stream.LiveServer(silence(), "127.0.0.1")
+        try:
+            base = srv.url.rsplit("/", 2)[0]
+            self.assertEqual(self._status(base + "/speakerbridge.wav"), 404)
+            self.assertEqual(self._status(base + "/wrong-token/speakerbridge.wav"), 404)
+            self.assertEqual(self._status(base + "/"), 404)
+            self.assertEqual(self._status(srv.url), 200)
         finally:
             srv.close()
 
