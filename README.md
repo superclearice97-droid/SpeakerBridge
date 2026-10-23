@@ -2,7 +2,7 @@
 
 Make Wi-Fi speakers from different brands (Sony, Vizio, Google Nest and others) play together, using only their built-in Wi-Fi. No adapters, no cloud, no subscription.
 
-**Current version: 0.1 — discovery.** It finds the speakers on your network, shows which wireless audio protocols each one supports, and tells you honestly whether SpeakerBridge will be able to send audio to it. Streaming arrives in 0.2.
+**Current release: 0.1 — discovery.** It finds the speakers on your network, shows which wireless audio protocols each one supports, and tells you honestly whether SpeakerBridge will be able to send audio to it. Linux → Cast streaming (below) is in the repository but is not part of a numbered release yet.
 
 **Test sound (Android):** tap a speaker, then **Play Test Sound**. The phone plays a short chime on it over Google Cast or DLNA (AirPlay not yet). On a Google Home speaker group, every member plays the chime together, in sync. Once you hear it, tap **I Heard It Play!** to mark the speaker Verified. To hear several speakers at once, tick them under **Play Together** on the main screen: SpeakerBridge loads the chime on each one, then starts them all at the same moment. Different brands can still land a fraction of a second apart (each buffers differently); a Google Home group remains the tightest sync for Cast speakers. The chime is generated on the phone and served only on your Wi-Fi; nothing leaves your network.
 
@@ -26,7 +26,7 @@ speakerbridge-stream "Living Room"            # name, part of a name, or device 
 speakerbridge-stream "Living Room" --format mp3   # if a speaker won't play the default WAV stream (needs ffmpeg)
 ```
 
-Or select the speaker in the desktop app and press **Stream this computer's audio here**. SpeakerBridge adds a virtual output called "SpeakerBridge", makes it the default, and moves what's already playing onto it, so everything the computer plays goes to the speaker. Stop (Ctrl+C or the button) and audio switches back to your usual output. Works with single speakers, Google Home speaker groups and stereo pairs. The stream stays on your local network. Cast speakers buffer a second or two, so for now this suits music rather than lip-synced video.
+Or select the speaker in the desktop app and press **Stream this computer's audio here**. SpeakerBridge adds a virtual output called "SpeakerBridge", makes it the default, and moves what's already playing onto it, so everything the computer plays goes to the speaker. Stop (Ctrl+C or the button) and audio switches back to your usual output. Works with single speakers, Google Home speaker groups and stereo pairs. The stream stays on your local network. It is plain HTTP, because Cast speakers fetch it that way, served at a random address that only the speaker is told, so other devices cannot simply connect to it. Anyone who can capture traffic on your network could still hear it, so only use it on a network you trust (see [SECURITY.md](SECURITY.md)). Cast speakers buffer a second or two, so for now this suits music rather than lip-synced video.
 
 Without installing, from the repo: `cd linux && python3 -m speakerbridge` (GUI) or `python3 -m speakerbridge scan`.
 
