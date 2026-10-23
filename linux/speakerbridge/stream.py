@@ -9,6 +9,7 @@ How it works:
 from __future__ import annotations
 
 import queue
+import secrets
 import shutil
 import socket
 import struct
@@ -130,7 +131,9 @@ class LiveServer:
     def __init__(self, source: Iterable[bytes], bind_ip: str, fmt: str = "wav"):
         self.fmt = fmt
         self.content_type = "audio/wav" if fmt == "wav" else "audio/mpeg"
-        self.path = f"/speakerbridge.{fmt}"
+        # unguessable address, different every run: the speaker is told it over Cast's encrypted connection, so
+        # other devices on the Wi-Fi that find the port still can't listen to this computer's audio
+        self.path = f"/{secrets.token_urlsafe(16)}.{fmt}"
         self._listeners: list[queue.Queue] = []
         self._lock = threading.Lock()
         server = self

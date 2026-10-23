@@ -16,6 +16,7 @@ import tempfile
 import threading
 import time
 import unittest
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -60,6 +61,23 @@ class LiveServerTest(unittest.TestCase):
             self.assertEqual(len(data), 44 + stream.CHUNK * 3)
         finally:
             srv.close()
+
+    def test_stream_needs_its_unguessable_address(self):
+        """Anyone on the Wi-Fi who finds the port must not be able to listen in: only the exact address
+        handed to the speaker works, and every run has a different one."""
+        a = stream.LiveServer(silence(), "127.0.0.1")
+        b = stream.LiveServer(silence(), "127.0.0.1")
+        try:
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+            base = a.url.rsplit("/", 1)[0]
+            for guess in ("/speakerbridge.wav", "/speakerbridge.mp3", "/", "/stream.wav"):
+                with self.assertRaises(urllib.error.HTTPError) as ctx:
+                    opener.open(base + guess, timeout=5)
+                self.assertEqual(ctx.exception.code, 404, guess)
+            self.assertNotEqual(a.path, b.path)
+            self.assertGreaterEqual(len(a.path), 20)
+        finally:
+            a.close(); b.close()
 
 
 # ------------------------------------------------------------ fake Cast speaker

@@ -6,6 +6,8 @@ Make Wi-Fi speakers from different brands (Sony, Vizio, Google Nest and others) 
 
 **Test sound (Android):** tap a speaker, then **Play Test Sound**. The phone plays a short chime on it over Google Cast or DLNA (AirPlay not yet). On a Google Home speaker group, every member plays the chime together, in sync. Once you hear it, tap **I Heard It Play!** to mark the speaker Verified. To hear several speakers at once, tick them under **Play Together** on the main screen: SpeakerBridge loads the chime on each one, then starts them all at the same moment. Different brands can still land a fraction of a second apart (each buffers differently); a Google Home group remains the tightest sync for Cast speakers. The chime is generated on the phone and served only on your Wi-Fi; nothing leaves your network.
 
+**Privacy, security limits and notices:** [PRIVACY.md](PRIVACY.md), [SECURITY.md](SECURITY.md) (the audio is not encrypted; read this before streaming), [NOTICE.md](NOTICE.md).
+
 ---
 
 ## Quick start
