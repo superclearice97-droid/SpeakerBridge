@@ -19,14 +19,51 @@ speakerbridge-scan               # same scan in the terminal
 speakerbridge-scan --json        # machine-readable output
 ```
 
-**Stream this computer's audio to a Cast speaker (new):**
+**Stream this computer's audio to speakers of different brands at once (new):**
 
 ```bash
-speakerbridge-stream "Living Room"            # name, part of a name, or device key
-speakerbridge-stream "Living Room" --format mp3   # if a speaker won't play the default WAV stream (needs ffmpeg)
+speakerbridge-stream "Living Room"                    # name, part of a name, or device key
+speakerbridge-stream "Kitchen Nest" "Sony" "Den HEOS"  # several speakers, any mix of brands
+speakerbridge-stream "Living Room" --format mp3        # if a speaker won't play the default WAV stream (needs ffmpeg)
 ```
 
-Or select the speaker in the desktop app and press **Stream this computer's audio here**. SpeakerBridge adds a virtual output called "SpeakerBridge", makes it the default, and moves what's already playing onto it, so everything the computer plays goes to the speaker. Stop (Ctrl+C or the button) and audio switches back to your usual output. Works with single speakers, Google Home speaker groups and stereo pairs. The stream stays on your local network. Cast speakers buffer a second or two, so for now this suits music rather than lip-synced video.
+Or select speakers in the desktop app (Ctrl+click to pick several) and press **Stream this computer's audio here**. SpeakerBridge adds a virtual output called "SpeakerBridge", makes it the default, and moves what's already playing onto it, so everything the computer plays goes to the speakers. Stop (Ctrl+C or the button) and audio switches back to your usual output.
+
+Each speaker gets the same stream over whichever protocol it speaks: **Google Cast** (Nest, Chromecast built-in Sony / Vizio / JBL and others, Google Home speaker groups and stereo pairs) or **DLNA / UPnP** (many Denon/HEOS, Yamaha MusicCast, LG, Samsung and older Sony speakers). If a speaker offers both, Cast is used. If one speaker can't play, the others keep going. The stream stays on your local network.
+
+Sync, honestly: every speaker buffers a second or two, so this suits music rather than lip-synced video. Speakers inside one Google Home group stay tightly in sync. Separate speakers, especially Cast and DLNA ones mixed, start out up to a second or two apart. That's fine for different rooms; in one room you'll hear an echo until you line them up.
+
+**Lining speakers up in one room (sync delay):**
+
+Automatically, with this computer's microphone (it asks first, every time):
+
+```bash
+speakerbridge-stream --auto-calibrate "Kitchen Nest" "Den HEOS"
+```
+
+Put the computer roughly where you listen, set the speakers to a normal volume and keep the room quiet. Each speaker in turn plays clicks for about 15 seconds while the microphone listens; SpeakerBridge works out how late each one is and saves the delays that line them up. In the desktop app: select the speakers and press **Line up with microphone…**. They end up in line where the microphone is (sound moves about 3 ms per metre). If a speaker can't be heard, turn it up or bring the computer closer and try again.
+
+Or by ear:
+
+```bash
+speakerbridge-stream --calibrate "Kitchen Nest" "Den HEOS"
+```
+
+Every speaker plays a click once a second. If you hear two clicks close together, add delay to the speaker that clicks first (`1 +50`, `1 -25`, `1 =400`) until you hear one click, then type `q` to save. In the desktop app, select the speakers, tick **Play sync clicks**, press Stream, and adjust each speaker's **Sync delay** box. Changes apply while it plays.
+
+Either way, delays (0–3000 ms) are saved per speaker in `~/.config/speakerbridge/delays.json` and used every time you stream to that speaker.
+
+Good to know: a speaker can only be held back, not sped up, so the slowest speaker stays at 0. With `--format mp3`, a delay changed mid-stream takes effect on the next stream.
+
+**Staying in sync (drift correction):** each speaker's clock runs very slightly fast or slow, enough to slide a couple of hundred ms apart over an hour. While streaming, SpeakerBridge asks each speaker how far it has played and, when one has slid from where it started, inserts or skips a few ms of audio for that speaker (with a 2 ms fade, so it doesn't click). It's automatic. You'll see the occasional "Nudged +15 ms to stay in sync" message. How tight it holds depends on what the speaker reports:
+
+| Speaker reports | Kept within |
+|---|---|
+| Google Cast (to the millisecond) | about ±15 ms |
+| DLNA with fractions of a second | about ±15 ms |
+| DLNA in whole seconds (most) | about ±30 ms |
+
+A speaker that doesn't report its position, or whose reports don't add up, isn't touched: SpeakerBridge says so and leaves it alone rather than guess. Drift correction needs the default WAV stream (not `--format mp3`).
 
 Without installing, from the repo: `cd linux && python3 -m speakerbridge` (GUI) or `python3 -m speakerbridge scan`.
 
@@ -47,6 +84,15 @@ Requirements: Android 8.0+ (minSdk 26), built against SDK 35. The compatibility 
 The Android design is dark and editorial: a hairline-grid header, tall condensed serif headlines, monospace captions, one red accent, and a perspective "floor" where every speaker found appears as a colour tile you can tap. Fonts (Inter, Lora, DejaVu Sans Mono) are bundled; see `android/FONTS.md`.
 
 ---
+
+## Privacy
+
+SpeakerBridge has no account, no cloud service and no analytics. Everything it does stays on your local network:
+
+- **Discovery** asks devices on your Wi-Fi what they are; it only fetches descriptions from local addresses.
+- **Streaming** serves your audio only to the speakers you chose, on your local network.
+- **Saved on this computer**, in `~/.config/speakerbridge/`: `verified.json` (speakers you marked as working) and `delays.json` (sync delays). Delete them any time.
+- **Microphone:** used only when you start microphone calibration, and only after you agree each time. The recording is kept in memory just long enough to time the clicks, cleared after each speaker, and never saved or sent anywhere.
 
 ## What the statuses mean
 
@@ -85,8 +131,8 @@ The scanner flags this when it sees a non-Google speaker with Cast ("can join a 
 |---|---|---|
 | 0.1 | Discovery on Linux + Android, shared compatibility database | **Done** |
 | 0.2 | Linux → Google Cast (single speakers and Cast groups) via an HTTP stream of PipeWire audio; AirPlay (RAOP) via PipeWire's built-in module | Cast streaming done; AirPlay next |
-| 0.3 | Multiple targets at once, saved groups, per-speaker volume | |
-| 0.4 | Sync engine: delay calibration for DLNA / mixed targets, drift monitoring | |
+| 0.3 | Multiple targets at once, saved groups, per-speaker volume | Linux: Cast + DLNA speakers at once done; saved groups and volume next |
+| 0.4 | Sync engine: delay calibration for DLNA / mixed targets, drift monitoring | Linux: done (sync delay by ear or microphone, drift correction) |
 | 0.5 | Android as an audio source (AudioPlaybackCapture, with your consent) | |
 | 0.6 | Sony / Vizio control APIs for volume and input, more DLNA devices | |
 | 1.0 | Stable release, APK + Linux package, docs | |
@@ -97,7 +143,7 @@ The scanner flags this when it sees a non-Google speaker with Cast ("can join a 
 
 ```
 android/                 Kotlin + Jetpack Compose app (discovery, compat, UI)
-linux/speakerbridge/     Python package: mdns.py, ssdp.py, scanner.py, compat.py, cli.py, gui.py
+linux/speakerbridge/     Python package: mdns.py, ssdp.py, scanner.py, compat.py, cli.py, gui.py, cast.py, dlna.py, stream.py, drift.py, mic.py
 shared/compatibility/    compatibility.json, the protocol and brand database both apps use
 shared/device-model/     JSON schema for exported devices
 scripts/                 install-cachyos.sh, diagnose-audio.sh
@@ -113,6 +159,6 @@ tests/                   Linux unit + loopback tests (python3 -m unittest discov
 ## Testing
 
 ```bash
-python3 -m unittest discover -s tests     # Linux: wire format, loopback mDNS/SSDP, classification
+python3 -m unittest discover -s tests     # Linux: wire format, loopback mDNS/SSDP, classification, Cast + DLNA streaming, sync
 cd android && ./gradlew test               # Android: mDNS wire format + AirPlay 2 detection
 ```

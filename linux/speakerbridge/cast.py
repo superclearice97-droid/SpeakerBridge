@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import queue
+import select
 import socket
 import ssl
 import struct
@@ -86,14 +87,17 @@ class CastSession:
         ctx.verify_mode = ssl.CERT_NONE
         raw = socket.create_connection((host, port), timeout=timeout)
         self.sock = ctx.wrap_socket(raw)
-        self.sock.settimeout(None)
+        # OpenSSL forbids reading and writing one TLS connection from two threads at once
+        # (it corrupts the stream: "bad record mac"). Every recv and send holds _io_lock, and
+        # the reader only takes it once select() says data is waiting.
+        self.sock.settimeout(0.05)
         self.inbox: queue.Queue = queue.Queue()
         self.request_id = 1
         self.last_ping = 0.0
         self.session_id = ""
         self.transport_id = ""
         self.media_session_id = 0
-        self._send_lock = threading.Lock()
+        self._io_lock = threading.Lock()
         threading.Thread(target=self._reader, daemon=True).start()
         self.send(RECEIVER, NS_CONNECTION, {"type": "CONNECT"})
 
@@ -110,7 +114,13 @@ class CastSession:
     def _read_exact(self, n: int) -> bytes:
         buf = b""
         while len(buf) < n:
-            chunk = self.sock.recv(n - len(buf))
+            if not self.sock.pending() and not select.select([self.sock], [], [], 0.5)[0]:
+                continue   # wait for data without holding the lock, so sends never queue behind it
+            with self._io_lock:
+                try:
+                    chunk = self.sock.recv(n - len(buf))
+                except TimeoutError:
+                    continue
             if not chunk:
                 raise CastError("the speaker closed the connection")
             buf += chunk
@@ -121,8 +131,12 @@ class CastSession:
             payload["requestId"] = self.request_id
             self.request_id += 1
         b = encode(SENDER, dest, namespace, json.dumps(payload))
-        with self._send_lock:
-            self.sock.sendall(struct.pack(">I", len(b)) + b)
+        with self._io_lock:
+            self.sock.settimeout(5)
+            try:
+                self.sock.sendall(struct.pack(">I", len(b)) + b)
+            finally:
+                self.sock.settimeout(0.05)
 
     def wait(self, timeout: float, match) -> dict | None:
         """Reads messages (answering heartbeats) until match(namespace, payload) is truthy."""
@@ -194,6 +208,11 @@ class CastSession:
         if not self.wait(20, ready):
             raise CastError("the speaker didn't finish loading the audio")
         return state["s"]
+
+    def get_status(self) -> None:
+        """Asks for a MEDIA_STATUS (which carries currentTime); the answer arrives via wait()."""
+        self.send(self.transport_id, NS_MEDIA,
+                  {"type": "GET_STATUS", "requestId": None, "mediaSessionId": self.media_session_id})
 
     def play(self) -> None:
         self.send(self.transport_id, NS_MEDIA,
