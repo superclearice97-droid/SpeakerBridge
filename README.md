@@ -6,6 +6,13 @@ Make Wi-Fi speakers from different brands (Sony, Vizio, Google Nest and others) 
 
 **Test sound (Android):** tap a speaker, then **Play Test Sound**. The phone plays a short chime on it over Google Cast or DLNA (AirPlay not yet). On a Google Home speaker group, every member plays the chime together, in sync. Once you hear it, tap **I Heard It Play!** to mark the speaker Verified. To hear several speakers at once, tick them under **Play Together** on the main screen: SpeakerBridge loads the chime on each one, then starts them all at the same moment. Different brands can still land a fraction of a second apart (each buffers differently); a Google Home group remains the tightest sync for Cast speakers. The chime is generated on the phone and served only on your Wi-Fi; nothing leaves your network.
 
+**Stream your phone's audio (Android 10+, new):** tick one or more speakers under **Play Together**, then tap **Stream phone audio**. Android asks for the audio recording permission and then to share your screen; that's how Android lets an app capture other apps' sound. SpeakerBridge takes only the sound (never the picture, never the microphone) and serves it as a live stream on your Wi-Fi to each speaker, over Google Cast or DLNA. Then play music in any app. A "Streaming" notification shows while it runs; stop it there, with **Stop streaming**, or with Android's own stop-sharing control. Good to know:
+
+- Apps can opt out of capture, and Android enforces that: many video apps (protected content) stream silence. SpeakerBridge doesn't work around it.
+- The phone keeps playing the sound itself too.
+- Speakers buffer a second or two, so it suits music rather than video. Separate speakers, especially Cast and DLNA ones mixed, can be noticeably apart; the sync delay and drift correction from the Linux app aren't on Android yet. Speakers in one Google Home group stay in sync.
+- It's for your own listening at home. Music and video services have their own terms about where their content may be played.
+
 ---
 
 ## Quick start
@@ -92,7 +99,8 @@ SpeakerBridge has no account, no cloud service and no analytics. Everything it d
 - **Discovery** asks devices on your Wi-Fi what they are; it only fetches descriptions from local addresses.
 - **Streaming** serves your audio only to the speakers you chose, on your local network.
 - **Saved on this computer**, in `~/.config/speakerbridge/`: `verified.json` (speakers you marked as working) and `delays.json` (sync delays). Delete them any time.
-- **Microphone:** used only when you start microphone calibration, and only after you agree each time. The recording is kept in memory just long enough to time the clicks, cleared after each speaker, and never saved or sent anywhere.
+- **Android streaming** captures only the sound other apps play (Android's audio playback capture, which asks for your consent each time), keeps it in memory just long enough to send it to the speakers you picked on your Wi-Fi, and never saves or uploads it. Android requires the audio recording permission for this, but the microphone isn't used.
+- **Microphone (Linux):** used only when you start microphone calibration, and only after you agree each time. The recording is kept in memory just long enough to time the clicks, cleared after each speaker, and never saved or sent anywhere.
 
 ## What the statuses mean
 
@@ -133,7 +141,7 @@ The scanner flags this when it sees a non-Google speaker with Cast ("can join a 
 | 0.2 | Linux → Google Cast (single speakers and Cast groups) via an HTTP stream of PipeWire audio; AirPlay (RAOP) via PipeWire's built-in module | Cast streaming done; AirPlay next |
 | 0.3 | Multiple targets at once, saved groups, per-speaker volume | Linux: Cast + DLNA speakers at once done; saved groups and volume next |
 | 0.4 | Sync engine: delay calibration for DLNA / mixed targets, drift monitoring | Linux: done (sync delay by ear or microphone, drift correction) |
-| 0.5 | Android as an audio source (AudioPlaybackCapture, with your consent) | |
+| 0.5 | Android as an audio source (AudioPlaybackCapture, with your consent) | Streaming to Cast + DLNA speakers done; sync delay and drift correction next |
 | 0.6 | Sony / Vizio control APIs for volume and input, more DLNA devices | |
 | 1.0 | Stable release, APK + Linux package, docs | |
 
