@@ -56,6 +56,7 @@ import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.lerp
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.withStyle
@@ -63,6 +64,8 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.speakerbridge.model.Device
+import com.speakerbridge.playback.PhoneStream
+import com.speakerbridge.playback.StreamState
 import com.speakerbridge.playback.TestSound
 import com.speakerbridge.ui.theme.SB
 import com.speakerbridge.ui.theme.SBType
@@ -94,6 +97,11 @@ fun statusColor(status: String): Color = when (status) {
 @Composable
 fun ScanScreen(vm: ScanViewModel) {
     val state by vm.state.collectAsStateWithLifecycle()
+    val stream by PhoneStream.state.collectAsStateWithLifecycle()
+    val context = LocalContext.current
+    val startStream = rememberStreamStarter {
+        vm.state.value.let { s -> s.visible.filter { it.key in s.together && TestSound.canPlay(it) } }
+    }
     var selected by remember { mutableStateOf<Device?>(null) }
     val listState = rememberLazyListState()
 
@@ -141,9 +149,10 @@ fun ScanScreen(vm: ScanViewModel) {
                 Hairline()
             }
             val playable = visible.filter { it.status != "not_speaker" && TestSound.canPlay(it) }
-            if (playable.size >= 2) {
+            if (playable.isNotEmpty()) {
                 item(key = "together") {
-                    PlayTogether(state, playable, vm::toggleTogether, vm::playTogether)
+                    PlayTogether(state, stream, playable, vm::toggleTogether, vm::playTogether,
+                        onStream = startStream, onStopStream = { PhoneStream.stop(context) })
                     Hairline()
                 }
             }
@@ -320,16 +329,21 @@ private fun Hero(state: UiState, speakers: Int, usable: Int) {
 /* --------------------------------------------------------- play together */
 
 @Composable
-private fun PlayTogether(state: UiState, playable: List<Device>, onToggle: (Device) -> Unit, onPlay: () -> Unit) {
+private fun PlayTogether(
+    state: UiState, stream: StreamState, playable: List<Device>, onToggle: (Device) -> Unit, onPlay: () -> Unit,
+    onStream: () -> Unit, onStopStream: () -> Unit,
+) {
     val picked = playable.count { it.key in state.together }
+    val busy = state.togetherBusy || stream.running
     Column(Modifier.padding(horizontal = 18.dp, vertical = 18.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
         Text("PLAY TOGETHER", style = SBType.MonoLabel)
-        Text("Pick two or more speakers and SpeakerBridge starts the chime on all of them at the same moment.",
+        Text("Pick speakers, then stream whatever your phone is playing to all of them, or play the test " +
+            "chime on two or more at the same moment.",
             style = SBType.BodySmall)
         for (d in playable) {
             val on = d.key in state.together
             Row(
-                Modifier.fillMaxWidth().clickable(enabled = !state.togetherBusy) { onToggle(d) }.padding(vertical = 6.dp),
+                Modifier.fillMaxWidth().clickable(enabled = !busy) { onToggle(d) }.padding(vertical = 6.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 Box(
@@ -343,30 +357,49 @@ private fun PlayTogether(state: UiState, playable: List<Device>, onToggle: (Devi
                     style = SBType.Mono.copy(color = SB.Dim), maxLines = 1)
             }
         }
-        val ready = picked >= 2 && !state.togetherBusy
-        Box(
-            Modifier
-                .background(if (ready) SB.Red else Color.Transparent, RoundedCornerShape(4.dp))
-                .border(1.dp, if (ready) SB.Red else SB.Line, RoundedCornerShape(4.dp))
-                .clickable(enabled = ready, onClick = onPlay)
-                .padding(horizontal = 18.dp, vertical = 10.dp),
-        ) {
-            Text(
-                when {
-                    state.togetherBusy -> "Playing…"
-                    picked < 2 -> "Pick at least two"
-                    else -> "Play Together ($picked)"
-                },
-                style = SBType.Button,
-            )
+        when {
+            !PhoneStream.supported -> PillButton("Streaming needs Android 10", enabled = false) {}
+            stream.running -> PillButton("Stop streaming", enabled = true, onClick = onStopStream)
+            picked == 0 -> PillButton("Pick a speaker to stream", enabled = false) {}
+            else -> PillButton("Stream phone audio ($picked)", enabled = !state.togetherBusy, onClick = onStream)
         }
+        stream.lines.forEach { Text(it, style = SBType.BodySmall.copy(color = SB.Cream)) }
+        PillButton(
+            when {
+                state.togetherBusy -> "Playing…"
+                picked < 2 -> "Chime needs two"
+                else -> "Play chime together ($picked)"
+            },
+            enabled = picked >= 2 && !busy,
+            onClick = onPlay,
+        )
         state.togetherLines.forEach { Text(it, style = SBType.BodySmall.copy(color = SB.Cream)) }
+        Text(
+            "Streaming sends your phone's sound, never its picture, and only over your Wi-Fi. Android asks to " +
+                "share your screen and to record audio because that's how it lets an app capture other apps' " +
+                "sound; the microphone isn't used. Some apps block capture (many video apps do), and your phone " +
+                "keeps playing too.",
+            style = SBType.BodySmall.copy(color = SB.Dim),
+        )
         Text(
             "Speakers of different brands can still land a fraction of a second apart. For Google Cast " +
                 "speakers, a speaker group made in the Google Home app keeps them perfectly in sync; it then " +
                 "shows up here as one speaker.",
             style = SBType.BodySmall.copy(color = SB.Dim),
         )
+    }
+}
+
+@Composable
+private fun PillButton(text: String, enabled: Boolean, onClick: () -> Unit) {
+    Box(
+        Modifier
+            .background(if (enabled) SB.Red else Color.Transparent, RoundedCornerShape(4.dp))
+            .border(1.dp, if (enabled) SB.Red else SB.Line, RoundedCornerShape(4.dp))
+            .clickable(enabled = enabled, onClick = onClick)
+            .padding(horizontal = 18.dp, vertical = 10.dp),
+    ) {
+        Text(text, style = SBType.Button)
     }
 }
 

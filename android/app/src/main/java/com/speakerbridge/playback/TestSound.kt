@@ -79,10 +79,10 @@ object TestSound {
         }
     }
 
-    private fun dlnaLocation(d: Device): String = d.protocols["dlna_renderer"]?.details?.get("location").orEmpty()
+    internal fun dlnaLocation(d: Device): String = d.protocols["dlna_renderer"]?.details?.get("location").orEmpty()
 
     /** The phone's own address on the network that reaches [ip] (no packet is sent). */
-    private fun localAddressFor(ip: String): InetAddress = DatagramSocket().use { s ->
+    internal fun localAddressFor(ip: String): InetAddress = DatagramSocket().use { s ->
         s.connect(InetAddress.getByName(ip), 9)
         s.localAddress.takeIf { !it.isAnyLocalAddress } ?: error("your phone has no route to the speaker")
     }

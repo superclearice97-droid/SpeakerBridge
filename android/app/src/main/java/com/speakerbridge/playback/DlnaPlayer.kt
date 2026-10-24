@@ -14,13 +14,7 @@ object DlnaPlayer {
      * The URL is set first, then held at [gate] so every speaker in the batch gets Play together.
      */
     fun play(location: String, url: String, contentType: String, title: String, gate: StartGate.Party) {
-        val loc = URL(location)
-        require(Ssdp.isLan(loc.host)) { "the speaker's address is not on your local network" }
-        val (serviceType, control, base) = avTransport(get(loc))
-            ?: error("this speaker doesn't offer DLNA playback (no AVTransport service)")
-        val controlUrl = URL(base?.let { URL(it) } ?: loc, control)
-        require(Ssdp.isLan(controlUrl.host)) { "the speaker's control address is not on your local network" }
-
+        val (serviceType, controlUrl) = transport(location)
         val didl = "<DIDL-Lite xmlns=\"urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/\" " +
             "xmlns:dc=\"http://purl.org/dc/elements/1.1/\" xmlns:upnp=\"urn:schemas-upnp-org:metadata-1-0/upnp/\">" +
             "<item id=\"0\" parentID=\"-1\" restricted=\"1\"><dc:title>${esc(title)}</dc:title>" +
@@ -34,6 +28,23 @@ object DlnaPlayer {
         val deadline = System.currentTimeMillis() + 20_000
         while (!gate.isOpen && System.currentTimeMillis() < deadline) Thread.sleep(2)
         soap(controlUrl, serviceType, "Play", "<Speed>1</Speed>")
+    }
+
+    /** Blocking; stops whatever the renderer is playing. */
+    fun stop(location: String) {
+        val (serviceType, controlUrl) = transport(location)
+        soap(controlUrl, serviceType, "Stop", "")
+    }
+
+    /** The renderer's AVTransport (serviceType, control URL), read from its description at [location]. */
+    private fun transport(location: String): Pair<String, URL> {
+        val loc = URL(location)
+        require(Ssdp.isLan(loc.host)) { "the speaker's address is not on your local network" }
+        val (serviceType, control, base) = avTransport(get(loc))
+            ?: error("this speaker doesn't offer DLNA playback (no AVTransport service)")
+        val controlUrl = URL(base?.let { URL(it) } ?: loc, control)
+        require(Ssdp.isLan(controlUrl.host)) { "the speaker's control address is not on your local network" }
+        return serviceType to controlUrl
     }
 
     private fun get(url: URL): String {

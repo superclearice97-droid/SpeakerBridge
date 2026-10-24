@@ -27,6 +27,7 @@ class CastPlayer(private val host: String, private val port: Int) {
     private lateinit var output: DataOutputStream
     private var requestId = 1
     private var lastPing = 0L
+    private var sessionId = ""
     private val inbox = LinkedBlockingQueue<Msg>()
     @Volatile private var readError: Throwable? = null
 
@@ -40,34 +41,8 @@ class CastPlayer(private val host: String, private val port: Int) {
         onStep: (String) -> Unit, gate: StartGate.Party,
     ) {
         open()
-        var sessionId = ""
         try {
-            send(RECEIVER, NS_CONNECTION, """{"type":"CONNECT"}""")
-            onStep("Starting the speaker's media player…")
-            send(RECEIVER, NS_RECEIVER, JSONObject().put("type", "LAUNCH").put("appId", APP_ID)
-                .put("requestId", requestId++).toString())
-            var transportId = ""
-            val launched = waitFor(15_000) { m ->
-                val j = JSONObject(m.payload)
-                when (j.optString("type")) {
-                    "LAUNCH_ERROR" -> error("the speaker refused to start its media player (${j.optString("reason")})")
-                    "RECEIVER_STATUS" -> {
-                        val apps = j.optJSONObject("status")?.optJSONArray("applications")
-                        for (i in 0 until (apps?.length() ?: 0)) {
-                            val a = apps!!.getJSONObject(i)
-                            if (a.optString("appId") == APP_ID) {
-                                transportId = a.optString("transportId")
-                                sessionId = a.optString("sessionId")
-                            }
-                        }
-                        transportId.isNotEmpty()
-                    }
-                    else -> false
-                }
-            }
-            if (!launched) error("the speaker didn't start its media player in time")
-
-            send(transportId, NS_CONNECTION, """{"type":"CONNECT"}""")
+            val transportId = launch(onStep)
             onStep("Sending the test sound…")
             val media = JSONObject().put("contentId", url).put("contentType", contentType)
                 .put("streamType", "BUFFERED")
@@ -133,12 +108,97 @@ class CastPlayer(private val host: String, private val port: Int) {
             }
             if (!finished && !started) error("the speaker never started playing")
         } finally {
-            if (sessionId.isNotEmpty()) runCatching {
-                send(RECEIVER, NS_RECEIVER, JSONObject().put("type", "STOP").put("sessionId", sessionId)
-                    .put("requestId", requestId++).toString())
-            }
-            runCatching { sock.close() }
+            stopAndClose()
         }
+    }
+
+    /**
+     * Blocking; call from Dispatchers.IO. Plays an endless live stream until [stopped] returns
+     * true, then closes the speaker's media player. Throws if the speaker refuses or ends it.
+     */
+    fun stream(url: String, contentType: String, title: String, onStep: (String) -> Unit, stopped: () -> Boolean) {
+        open()
+        try {
+            val transportId = launch(onStep)
+            onStep("Starting the stream…")
+            val media = JSONObject().put("contentId", url).put("contentType", contentType)
+                .put("streamType", "LIVE")
+                .put("metadata", JSONObject().put("metadataType", 0).put("title", title))
+            send(transportId, NS_MEDIA, JSONObject().put("type", "LOAD").put("requestId", requestId++)
+                .put("media", media).put("autoplay", true).toString())
+            val started = waitFor(20_000) { m ->
+                if (m.namespace != NS_MEDIA) return@waitFor false
+                val j = JSONObject(m.payload)
+                when (j.optString("type")) {
+                    "LOAD_FAILED", "LOAD_CANCELLED", "INVALID_REQUEST" ->
+                        error("the speaker couldn't load the stream (${j.optString("type")})")
+                    "MEDIA_STATUS" -> {
+                        val st = j.optJSONArray("status")?.optJSONObject(0) ?: return@waitFor false
+                        if (st.optString("playerState") == "IDLE" && st.optString("idleReason") == "ERROR")
+                            error("the speaker couldn't play the stream")
+                        st.optString("playerState") in setOf("PLAYING", "BUFFERING", "PAUSED")
+                    }
+                    else -> false
+                }
+            }
+            if (!started) error("the speaker didn't start the stream")
+            onStep("Streaming.")
+            while (!stopped()) {
+                val ended = waitFor(500) { m ->
+                    val j = JSONObject(m.payload)
+                    when {
+                        m.namespace == NS_RECEIVER && j.optString("type") == "RECEIVER_STATUS" -> {
+                            val apps = j.optJSONObject("status")?.optJSONArray("applications")
+                            (0 until (apps?.length() ?: 0)).none { apps!!.getJSONObject(it).optString("appId") == APP_ID }
+                        }
+                        m.namespace == NS_MEDIA ->
+                            j.optJSONArray("status")?.optJSONObject(0)?.optString("playerState") == "IDLE"
+                        else -> false
+                    }
+                }
+                if (ended) error("the speaker stopped the stream (stopped from elsewhere, or it lost the connection)")
+            }
+        } finally {
+            stopAndClose()
+        }
+    }
+
+    /** Starts the Default Media Receiver and connects to it. Returns its transport id. */
+    private fun launch(onStep: (String) -> Unit): String {
+        send(RECEIVER, NS_CONNECTION, """{"type":"CONNECT"}""")
+        onStep("Starting the speaker's media player…")
+        send(RECEIVER, NS_RECEIVER, JSONObject().put("type", "LAUNCH").put("appId", APP_ID)
+            .put("requestId", requestId++).toString())
+        var transportId = ""
+        val launched = waitFor(15_000) { m ->
+            val j = JSONObject(m.payload)
+            when (j.optString("type")) {
+                "LAUNCH_ERROR" -> error("the speaker refused to start its media player (${j.optString("reason")})")
+                "RECEIVER_STATUS" -> {
+                    val apps = j.optJSONObject("status")?.optJSONArray("applications")
+                    for (i in 0 until (apps?.length() ?: 0)) {
+                        val a = apps!!.getJSONObject(i)
+                        if (a.optString("appId") == APP_ID) {
+                            transportId = a.optString("transportId")
+                            sessionId = a.optString("sessionId")
+                        }
+                    }
+                    transportId.isNotEmpty()
+                }
+                else -> false
+            }
+        }
+        if (!launched) error("the speaker didn't start its media player in time")
+        send(transportId, NS_CONNECTION, """{"type":"CONNECT"}""")
+        return transportId
+    }
+
+    private fun stopAndClose() {
+        if (sessionId.isNotEmpty()) runCatching {
+            send(RECEIVER, NS_RECEIVER, JSONObject().put("type", "STOP").put("sessionId", sessionId)
+                .put("requestId", requestId++).toString())
+        }
+        runCatching { sock.close() }
     }
 
     private fun open() {
