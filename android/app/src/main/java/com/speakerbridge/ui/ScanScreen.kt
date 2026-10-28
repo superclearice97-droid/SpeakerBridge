@@ -373,6 +373,7 @@ private fun PlayTogether(
             )
             null -> {}
         }
+        stream.phone?.let { Text(it, style = SBType.BodySmall.copy(color = SB.Cream)) }
         stream.lines.forEach { Text(it, style = SBType.BodySmall.copy(color = SB.Cream)) }
         PillButton(
             when {
@@ -391,9 +392,9 @@ private fun PlayTogether(
             style = SBType.BodySmall.copy(color = SB.Dim),
         )
         Text(
-            "Your phone keeps playing out loud too: Android copies the sound rather than moving it, and the " +
-                "speakers play it a second or two later, so the phone will sound out of step with them. Turn " +
-                "the phone's own volume down; the line above shows whether sound is still reaching the speakers.",
+            "Android copies the sound rather than moving it, so SpeakerBridge mutes your phone once music " +
+                "starts (and unmutes it when you stop), so it doesn't play ahead of the speakers. If your phone " +
+                "can't stay muted while sharing, the app says so.",
             style = SBType.BodySmall.copy(color = SB.Dim),
         )
         Text(

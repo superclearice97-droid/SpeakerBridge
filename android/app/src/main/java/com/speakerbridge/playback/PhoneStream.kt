@@ -13,6 +13,7 @@ import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.media.AudioAttributes
 import android.media.AudioFormat
+import android.media.AudioManager
 import android.media.AudioPlaybackCaptureConfiguration
 import android.media.AudioRecord
 import android.media.projection.MediaProjection
@@ -22,6 +23,7 @@ import android.os.Build
 import android.os.Handler
 import android.os.IBinder
 import android.os.PowerManager
+import android.os.SystemClock
 import com.speakerbridge.MainActivity
 import com.speakerbridge.model.Device
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -32,6 +34,7 @@ data class StreamState(
     val running: Boolean = false,
     val lines: List<String> = emptyList(),   // one status line per speaker, or a single error
     val hearing: Boolean? = null,            // is any sound being captured? null until it's known
+    val phone: String? = null,               // whether the phone itself has been quietened
 )
 
 /**
@@ -71,6 +74,8 @@ object PhoneStream {
     }
 
     internal fun hearing(sound: Boolean) = _state.update { if (it.running) it.copy(hearing = sound) else it }
+
+    internal fun phoneNote(msg: String) = _state.update { if (it.running) it.copy(phone = msg) else it }
 
     internal fun ended(lastError: String? = null) = _state.update {
         StreamState(false, if (lastError != null) listOf(lastError) else it.lines)
@@ -124,6 +129,21 @@ class PhoneStreamService : Service() {
         var record: AudioRecord? = null
         var server: LiveStreamServer? = null
         var error: String? = null
+        val audio = getSystemService(AudioManager::class.java)
+        val phone = PhoneQuiet(
+            mute = {
+                when {
+                    audio.isVolumeFixed -> PhoneQuiet.Mute.NOT_ALLOWED
+                    audio.isStreamMute(AudioManager.STREAM_MUSIC) -> PhoneQuiet.Mute.ALREADY
+                    else -> {
+                        audio.adjustStreamVolume(AudioManager.STREAM_MUSIC, AudioManager.ADJUST_MUTE, 0)
+                        PhoneQuiet.Mute.DONE
+                    }
+                }
+            },
+            unmute = { audio.adjustStreamVolume(AudioManager.STREAM_MUSIC, AudioManager.ADJUST_UNMUTE, 0) },
+            say = PhoneStream::phoneNote,
+        )
         try {
             power.acquire(12 * 60 * 60 * 1000L)
             wifi.acquire()
@@ -140,6 +160,7 @@ class PhoneStreamService : Service() {
                     if (n > 0) {
                         s.push(buf.copyOf(n))
                         quiet.feed(buf, n)?.let(PhoneStream::hearing)
+                        phone.feed(isLoud(buf, n), SystemClock.elapsedRealtime())
                     } else if (n < 0) break
                 }
             }.also { it.start() }
@@ -151,6 +172,7 @@ class PhoneStreamService : Service() {
             error = "Couldn't stream: ${e.message ?: e.javaClass.simpleName}"
         } finally {
             stopped = true
+            runCatching { phone.release() }   // the phone plays out loud again
             runCatching { record?.stop() }
             record?.release()
             server?.close()
@@ -248,13 +270,7 @@ internal class SilenceWatch(private val rate: Int = LiveStreamServer.RATE, priva
     private var answer: Boolean? = null
 
     fun feed(pcm: ByteArray, n: Int): Boolean? {
-        var loud = false
-        var i = 0
-        while (i + 1 < n && !loud) {
-            val v = (pcm[i].toInt() and 0xff) or (pcm[i + 1].toInt() shl 8)   // 16-bit little-endian
-            if (v > THRESHOLD || v < -THRESHOLD) loud = true
-            i += 2
-        }
+        val loud = isLoud(pcm, n)
         silentBytes = if (loud) 0 else silentBytes + n
         val now = when {
             loud -> true
@@ -265,7 +281,84 @@ internal class SilenceWatch(private val rate: Int = LiveStreamServer.RATE, priva
     }
 
     private companion object {
-        const val THRESHOLD = 64    // of 32767: well below anything audible, above dither
         const val QUIET_SECONDS = 3
+    }
+}
+
+/** Whether 16-bit little-endian PCM has any real sound in it (not just silence or dither). */
+internal fun isLoud(pcm: ByteArray, n: Int): Boolean {
+    var i = 0
+    while (i + 1 < n) {
+        val v = (pcm[i].toInt() and 0xff) or (pcm[i + 1].toInt() shl 8)
+        if (v > 64 || v < -64) return true   // of 32767: well below anything audible, above dither
+        i += 2
+    }
+    return false
+}
+
+/**
+ * Keeps the phone itself quiet while it streams. Android copies the sound rather than moving
+ * it, so the phone would otherwise go on playing, a second or two ahead of the speakers. Once
+ * sound is flowing, the phone's media volume is muted. On some phones muting also silences what
+ * is shared, so the moments after muting are checked: if the speakers would only get silence,
+ * the phone is unmuted straight away and the user is told. release() unmutes when streaming ends.
+ */
+internal class PhoneQuiet(
+    private val mute: () -> Mute,
+    private val unmute: () -> Unit,
+    private val say: (String) -> Unit,
+) {
+    enum class Mute { DONE, ALREADY, NOT_ALLOWED }
+    private enum class Step { WAITING, CHECKING, MUTED, LEFT_ALONE }
+
+    private var step = Step.WAITING
+    private var soundSince = -1L
+    private var mutedAt = 0L
+    private var lastLoud = -1L
+
+    /** One captured chunk: whether it had sound, and when (ms, any steady clock). */
+    @Synchronized fun feed(loud: Boolean, nowMs: Long) {
+        if (loud) lastLoud = nowMs
+        when (step) {
+            Step.WAITING -> {   // wait for music, so there's something to check with
+                if (!loud) { soundSince = -1; return }
+                if (soundSince < 0) soundSince = nowMs
+                if (nowMs - soundSince < SOUND_FIRST_MS) return
+                when (mute()) {
+                    Mute.DONE -> { step = Step.CHECKING; mutedAt = nowMs }
+                    Mute.ALREADY -> step = Step.LEFT_ALONE   // the user muted it already: theirs to undo
+                    Mute.NOT_ALLOWED -> {
+                        step = Step.LEFT_ALONE
+                        say("This phone doesn't let apps change its volume, so it keeps playing too. Turn it down yourself.")
+                    }
+                }
+            }
+            Step.CHECKING -> {
+                if (nowMs - mutedAt < CHECK_MS) return
+                // Audio captured just before muting can still be arriving for a few hundred ms,
+                // so only sound well after the mute proves the speakers still get it.
+                if (lastLoud >= mutedAt + PROOF_AFTER_MS) {
+                    step = Step.MUTED
+                    say("Your phone is muted while it streams, so only the speakers play. It unmutes when you stop.")
+                } else {
+                    unmute()
+                    step = Step.LEFT_ALONE
+                    say("This phone also silences what it shares when it's muted, so it can't stay quiet while " +
+                        "streaming. Turn its volume down as far as you can while the speakers still play.")
+                }
+            }
+            else -> {}
+        }
+    }
+
+    @Synchronized fun release() {
+        if (step == Step.CHECKING || step == Step.MUTED) unmute()
+        step = Step.LEFT_ALONE
+    }
+
+    private companion object {
+        const val SOUND_FIRST_MS = 300L
+        const val CHECK_MS = 1500L
+        const val PROOF_AFTER_MS = 700L
     }
 }
