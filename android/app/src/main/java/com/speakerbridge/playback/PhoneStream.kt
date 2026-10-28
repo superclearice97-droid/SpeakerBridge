@@ -31,6 +31,7 @@ import kotlinx.coroutines.flow.update
 data class StreamState(
     val running: Boolean = false,
     val lines: List<String> = emptyList(),   // one status line per speaker, or a single error
+    val hearing: Boolean? = null,            // is any sound being captured? null until it's known
 )
 
 /**
@@ -68,6 +69,8 @@ object PhoneStream {
     internal fun setLine(i: Int, line: String) = _state.update {
         it.copy(lines = it.lines.toMutableList().also { l -> if (i in l.indices) l[i] = line })
     }
+
+    internal fun hearing(sound: Boolean) = _state.update { if (it.running) it.copy(hearing = sound) else it }
 
     internal fun ended(lastError: String? = null) = _state.update {
         StreamState(false, if (lastError != null) listOf(lastError) else it.lines)
@@ -131,9 +134,13 @@ class PhoneStreamService : Service() {
             val r = record
             val capture = Thread {
                 val buf = ByteArray(CHUNK)
+                val quiet = SilenceWatch()
                 while (!stopped) {
                     val n = r.read(buf, 0, buf.size)
-                    if (n > 0) s.push(buf.copyOf(n)) else if (n < 0) break
+                    if (n > 0) {
+                        s.push(buf.copyOf(n))
+                        quiet.feed(buf, n)?.let(PhoneStream::hearing)
+                    } else if (n < 0) break
                 }
             }.also { it.start() }
             val players = devices.mapIndexed { i, d -> Thread { play(i, d, s.url) }.also { it.start() } }
@@ -228,5 +235,37 @@ class PhoneStreamService : Service() {
         const val CHANNEL = "stream"
         const val NOTIFICATION_ID = 1
         const val CHUNK = LiveStreamServer.RATE * LiveStreamServer.CHANNELS * 2 / 50   // 20 ms
+    }
+}
+
+/**
+ * Tells whether captured audio is real sound or silence, so the app can say when only silence
+ * is reaching the speakers (nothing playing, or an app that doesn't allow its sound to be
+ * shared). feed() returns the new answer when it changes, else null.
+ */
+internal class SilenceWatch(private val rate: Int = LiveStreamServer.RATE, private val channels: Int = LiveStreamServer.CHANNELS) {
+    private var silentBytes = 0L
+    private var answer: Boolean? = null
+
+    fun feed(pcm: ByteArray, n: Int): Boolean? {
+        var loud = false
+        var i = 0
+        while (i + 1 < n && !loud) {
+            val v = (pcm[i].toInt() and 0xff) or (pcm[i + 1].toInt() shl 8)   // 16-bit little-endian
+            if (v > THRESHOLD || v < -THRESHOLD) loud = true
+            i += 2
+        }
+        silentBytes = if (loud) 0 else silentBytes + n
+        val now = when {
+            loud -> true
+            silentBytes >= QUIET_SECONDS * rate * channels * 2 -> false
+            else -> answer   // a short pause between songs doesn't count
+        }
+        return now.takeIf { it != answer }.also { if (now != null) answer = now }
+    }
+
+    private companion object {
+        const val THRESHOLD = 64    // of 32767: well below anything audible, above dither
+        const val QUIET_SECONDS = 3
     }
 }

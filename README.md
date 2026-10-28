@@ -8,8 +8,9 @@ Make Wi-Fi speakers from different brands (Sony, Vizio, Google Nest and others) 
 
 **Stream your phone's audio (Android 10+, new):** tick one or more speakers under **Play Together**, then tap **Stream phone audio**. Android asks for the audio recording permission and then to share your screen; that's how Android lets an app capture other apps' sound. SpeakerBridge takes only the sound (never the picture, never the microphone) and serves it as a live stream on your Wi-Fi to each speaker, over Google Cast or DLNA. Then play music in any app. A "Streaming" notification shows while it runs; stop it there, with **Stop streaming**, or with Android's own stop-sharing control. Good to know:
 
-- Apps can opt out of capture, and Android enforces that: many video apps (protected content) stream silence. SpeakerBridge doesn't work around it.
-- The phone keeps playing the sound itself too.
+- Apps can opt out of capture, and Android enforces that: many video apps (protected content) stream silence. SpeakerBridge doesn't work around it. While streaming, the app says whether it's sending sound or only silence.
+- The phone keeps playing the sound itself too (Android copies the sound, it doesn't move it), a second or two ahead of the speakers. Turn the phone's own volume down, and check the app still says it's sending sound.
+- A speaker only shows "Streaming." once it's actually playing. Some TVs load the stream paused, so SpeakerBridge presses play for you; one that still won't play is reported (it may not support this kind of audio stream).
 - Speakers buffer a second or two, so it suits music rather than video. Separate speakers, especially Cast and DLNA ones mixed, can be noticeably apart; the sync delay and drift correction from the Linux app aren't on Android yet. Speakers in one Google Home group stay in sync.
 - It's for your own listening at home. Music and video services have their own terms about where their content may be played.
 

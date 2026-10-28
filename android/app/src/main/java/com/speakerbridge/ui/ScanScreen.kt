@@ -363,6 +363,16 @@ private fun PlayTogether(
             picked == 0 -> PillButton("Pick a speaker to stream", enabled = false) {}
             else -> PillButton("Stream phone audio ($picked)", enabled = !state.togetherBusy, onClick = onStream)
         }
+        if (stream.running) when (stream.hearing) {
+            true -> Text("Sending your phone's sound.", style = SBType.BodySmall.copy(color = SB.Cream))
+            false -> Text(
+                "Only silence is reaching the speakers. Is something playing? Some apps (many video and " +
+                    "music apps) don't allow their sound to be shared. If this appeared just as you turned the " +
+                    "phone's volume down, your phone lowers what it shares too: turn it back up a little.",
+                style = SBType.BodySmall.copy(color = SB.Red),
+            )
+            null -> {}
+        }
         stream.lines.forEach { Text(it, style = SBType.BodySmall.copy(color = SB.Cream)) }
         PillButton(
             when {
@@ -377,8 +387,13 @@ private fun PlayTogether(
         Text(
             "Streaming sends your phone's sound, never its picture, and only over your Wi-Fi. Android asks to " +
                 "share your screen and to record audio because that's how it lets an app capture other apps' " +
-                "sound; the microphone isn't used. Some apps block capture (many video apps do), and your phone " +
-                "keeps playing too.",
+                "sound; the microphone isn't used. Some apps block capture (many video apps do).",
+            style = SBType.BodySmall.copy(color = SB.Dim),
+        )
+        Text(
+            "Your phone keeps playing out loud too: Android copies the sound rather than moving it, and the " +
+                "speakers play it a second or two later, so the phone will sound out of step with them. Turn " +
+                "the phone's own volume down; the line above shows whether sound is still reaching the speakers.",
             style = SBType.BodySmall.copy(color = SB.Dim),
         )
         Text(
