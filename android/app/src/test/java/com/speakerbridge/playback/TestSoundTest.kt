@@ -56,4 +56,36 @@ class TestSoundTest {
             assertEquals(404, missing.responseCode)
         }
     }
+
+    @Test
+    fun serverAlsoServesTheChimeAsRawL16() {
+        val wav = TestTone.wav()
+        ToneServer(InetAddress.getLoopbackAddress(), wav, TestTone.CONTENT_TYPE).use { s ->
+            val c = URL(s.urlL16).openConnection() as HttpURLConnection
+            assertEquals("audio/L16;rate=44100;channels=1", c.contentType)
+            val body = c.inputStream.use { it.readBytes() }
+            assertEquals(wav.size - 44, body.size)                       // no file header
+            assertEquals(wav[44 + 20001], body[20000])                   // and each sample's bytes swapped
+            assertEquals(wav[44 + 20000], body[20001])
+        }
+    }
+
+    @Test
+    fun dlnaSpeakersGetTheChimeInTheFormTheyPlay() {
+        val tv = FakeRenderer()                                                       // doesn't say: raw L16, like LG TVs want
+        val hifi = FakeRenderer(sinks = "http-get:*:audio/x-wav:*,http-get:*:audio/mpeg:*")   // says WAV, not L16
+        val strict = FakeRenderer(rejects = { it.startsWith("audio/L16") })           // refuses L16 outright
+        try {
+            val devices = listOf(tv.device("TV"), hifi.device("HiFi"), strict.device("Strict"))
+            val results = TestSound.playMany(devices) { _, _ -> }
+            assertTrue(results.values.all { it.isSuccess })
+            assertEquals(listOf("audio/L16;rate=44100;channels=1|live"), tv.offered.toList())
+            assertEquals(listOf("audio/wav|live"), hifi.offered.toList())
+            assertEquals("audio/wav|live", strict.offered.last())
+            assertTrue(tv.player.contentType.startsWith("audio/L16") && hifi.player.contentType == "audio/wav")
+            assertTrue(listOf(tv, hifi, strict).all { "Play" in it.actions })
+        } finally {
+            listOf(tv, hifi, strict).forEach { it.close() }
+        }
+    }
 }

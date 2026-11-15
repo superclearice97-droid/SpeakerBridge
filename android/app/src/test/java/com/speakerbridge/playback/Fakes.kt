@@ -77,7 +77,7 @@ class FakePlayer(private val bufferS: Double = 0.3, ppm: Double = 0.0) {
             val input = DataInputStream(BufferedInputStream(s.getInputStream()))
             val head = StringBuilder()
             while (!head.endsWith("\r\n\r\n")) head.append(input.readUnsignedByte().toChar())
-            if (" 200" !in head.lineSequence().first()) return
+            if (head.lineSequence().first().split(' ').getOrNull(1) !in setOf("200", "206")) return
             contentType = Regex("Content-Type: (.*)\r").find(head)?.groupValues?.get(1).orEmpty()
             contentLength = Regex("Content-Length: (.*)\r").find(head)?.groupValues?.get(1).orEmpty()
             if (contentType.startsWith("audio/wav")) input.readFully(ByteArray(44))

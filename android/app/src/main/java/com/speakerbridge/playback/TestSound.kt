@@ -51,7 +51,7 @@ object TestSound {
             devices.map { d ->
                 Thread {
                     val party = gate.party()
-                    results[d] = runCatching { playOne(d, server.url, party) { onStep(d, it) } }
+                    results[d] = runCatching { playOne(d, server, party) { onStep(d, it) } }
                         .also { party.arrive() }   // a failed speaker must not hold the others back
                 }.also { it.start() }
             }.forEach { it.join() }
@@ -59,7 +59,8 @@ object TestSound {
         return results
     }
 
-    private fun playOne(d: Device, url: String, party: StartGate.Party, onStep: (String) -> Unit): String {
+    private fun playOne(d: Device, server: ToneServer, party: StartGate.Party, onStep: (String) -> Unit): String {
+        val url = server.url
         val cast = d.protocols["googlecast"]
         return if (cast != null) {
             onStep("Connecting to the speaker…")
@@ -73,7 +74,12 @@ object TestSound {
             onStep("Sending the test sound over DLNA…")
             val renderer = DlnaRenderer(location)
             runCatching { renderer.stop() }   // some renderers need an idle transport first
-            renderer.setUri(url, TestTone.CONTENT_TYPE, "*", TITLE)
+            // Many TVs only take uncompressed audio as raw L16, so that goes first unless it lists WAV and not L16.
+            val l16 = DlnaRenderer.order(renderer.sinks()).first().isL16
+            fun offer(asL16: Boolean) =
+                if (asL16) renderer.setUri(server.urlL16, TestTone.L16_CONTENT_TYPE, Variant.L16.dlnaFeatures, TITLE)
+                else renderer.setUri(url, TestTone.CONTENT_TYPE, "*", TITLE)
+            try { offer(l16) } catch (_: DlnaError) { offer(!l16) }   // refused outright: offer the other form
             // The URL is set first, then held at the gate so every speaker in the batch gets Play together.
             party.arrive()
             val deadline = System.currentTimeMillis() + 20_000
