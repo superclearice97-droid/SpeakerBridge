@@ -71,7 +71,14 @@ object TestSound {
             val location = dlnaLocation(d)
             require(location.isNotEmpty()) { "this speaker only offers AirPlay, which SpeakerBridge can't send to yet" }
             onStep("Sending the test sound over DLNA…")
-            DlnaPlayer.play(location, url, TestTone.CONTENT_TYPE, TITLE, party)
+            val renderer = DlnaRenderer(location)
+            runCatching { renderer.stop() }   // some renderers need an idle transport first
+            renderer.setUri(url, TestTone.CONTENT_TYPE, "*", TITLE)
+            // The URL is set first, then held at the gate so every speaker in the batch gets Play together.
+            party.arrive()
+            val deadline = System.currentTimeMillis() + 20_000
+            while (!party.isOpen && System.currentTimeMillis() < deadline) Thread.sleep(2)
+            renderer.play()
             onStep("Playing now. Listen for the chime.")
             // DLNA gives no "finished" signal; keep the file available while the speaker fetches and plays it.
             Thread.sleep(TestTone.DURATION_MS + 8000)

@@ -114,11 +114,18 @@ class CastPlayer(private val host: String, private val port: Int) {
 
     /**
      * Blocking; call from Dispatchers.IO. Plays an endless live stream until [stopped] returns
-     * true, then closes the speaker's media player. Throws if the speaker refuses or ends it.
+     * true, then closes the speaker's media player. Throws [NeverPlayed] if the speaker never
+     * got as far as playing (so another route can be tried), or another exception if it
+     * stopped later. [onPlaying] fires once it really plays; [onPosition] gets how many seconds
+     * of the stream it says it has played, every couple of seconds, for drift correction.
      */
-    fun stream(url: String, contentType: String, title: String, onStep: (String) -> Unit, stopped: () -> Boolean) {
-        open()
+    fun stream(
+        url: String, contentType: String, title: String, onStep: (String) -> Unit, stopped: () -> Boolean,
+        onPlaying: () -> Unit = {}, onPosition: (Double) -> Unit = {}, log: (String) -> Unit = {},
+    ) {
+        var playing = false
         try {
+            open()
             val transportId = launch(onStep)
             onStep("Starting the stream…")
             val media = JSONObject().put("contentId", url).put("contentType", contentType)
@@ -131,14 +138,19 @@ class CastPlayer(private val host: String, private val port: Int) {
             /** Reads one MEDIA_STATUS: remembers its state, throws if the speaker gave up. */
             fun status(j: JSONObject): Boolean {
                 when (j.optString("type")) {
-                    "LOAD_FAILED", "LOAD_CANCELLED", "INVALID_REQUEST" ->
+                    "LOAD_FAILED", "LOAD_CANCELLED", "INVALID_REQUEST" -> {
+                        log("cast: ${j.toString().take(300)}")
                         error("the speaker couldn't load the stream (${j.optString("type")})")
+                    }
                     "MEDIA_STATUS" -> {
                         val st = j.optJSONArray("status")?.optJSONObject(0) ?: return false
                         mediaSessionId = st.optInt("mediaSessionId", mediaSessionId)
-                        state = st.optString("playerState")
+                        val now = st.optString("playerState")
+                        if (now != state) log("cast: $now ${st.optString("idleReason")}".trimEnd())
+                        state = now
                         if (state == "IDLE" && st.optString("idleReason") == "ERROR")
                             error("the speaker couldn't play the stream (it may not support this kind of audio)")
+                        if (state == "PLAYING" && st.has("currentTime")) onPosition(st.optDouble("currentTime"))
                         return true
                     }
                 }
@@ -161,8 +173,16 @@ class CastPlayer(private val host: String, private val port: Int) {
                 error("the speaker took the stream but won't play it (it stayed ${state.lowercase().ifEmpty { "silent" }}). " +
                     "It may not support this kind of audio stream")
             }
+            playing = true
+            onPlaying()
             onStep("Streaming.")
+            var nextPoll = 0L
             while (!stopped()) {
+                if (System.currentTimeMillis() >= nextPoll) {
+                    send(transportId, NS_MEDIA, JSONObject().put("type", "GET_STATUS").put("requestId", requestId++)
+                        .put("mediaSessionId", mediaSessionId).toString())
+                    nextPoll = System.currentTimeMillis() + POLL_MS
+                }
                 val was = state
                 val ended = waitFor(500) { m ->
                     val j = JSONObject(m.payload)
@@ -182,6 +202,9 @@ class CastPlayer(private val host: String, private val port: Int) {
                     "BUFFERING" -> onStep("The speaker is catching up (buffering)…")
                 }
             }
+        } catch (e: Exception) {
+            log("cast: ${e.message ?: e.javaClass.simpleName}")
+            throw if (playing) e else NeverPlayed(e.message ?: e.javaClass.simpleName)
         } finally {
             stopAndClose()
         }
@@ -222,7 +245,7 @@ class CastPlayer(private val host: String, private val port: Int) {
             send(RECEIVER, NS_RECEIVER, JSONObject().put("type", "STOP").put("sessionId", sessionId)
                 .put("requestId", requestId++).toString())
         }
-        runCatching { sock.close() }
+        runCatching { sock.close() }   // also covers a connection that never opened
     }
 
     private fun open() {
@@ -296,6 +319,8 @@ class CastPlayer(private val host: String, private val port: Int) {
         const val APP_ID = "CC1AD845"   // Google's Default Media Receiver
         /** How long a speaker gets, after loading the stream, to actually start playing it. */
         @JvmField var PLAY_TIMEOUT_MS = 15_000L
+        /** How often a playing speaker is asked how far it has got. */
+        @JvmField var POLL_MS = 2_000L
         const val SENDER = "sender-0"
         const val RECEIVER = "receiver-0"
         const val NS_CONNECTION = "urn:x-cast:com.google.cast.tp.connection"

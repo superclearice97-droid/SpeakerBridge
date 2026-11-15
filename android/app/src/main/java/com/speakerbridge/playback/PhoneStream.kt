@@ -25,6 +25,7 @@ import android.os.IBinder
 import android.os.PowerManager
 import android.os.SystemClock
 import com.speakerbridge.MainActivity
+import com.speakerbridge.data.SyncStore
 import com.speakerbridge.model.Device
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -43,7 +44,6 @@ data class StreamState(
  * every time and leaves out apps that don't allow capture.
  */
 object PhoneStream {
-    const val TITLE = "This phone (SpeakerBridge)"
     internal const val ACTION_STOP = "com.speakerbridge.STOP_STREAM"
 
     private val _state = MutableStateFlow(StreamState())
@@ -51,6 +51,12 @@ object PhoneStream {
 
     /** The consent result and speakers, handed to the service as it starts. */
     internal var pending: Triple<Int, Intent, List<Device>>? = null
+
+    /** The stream that is running, if any. */
+    @Volatile internal var session: StreamSession? = null
+
+    /** Changes a speaker's sync delay straight away if it is being streamed to. */
+    fun setDelay(key: String, ms: Int) { session?.setDelay(key, ms) }
 
     val supported: Boolean get() = Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q
 
@@ -127,7 +133,7 @@ class PhoneStreamService : Service() {
         val wifi = (applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager)
             .createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "speakerbridge:stream")
         var record: AudioRecord? = null
-        var server: LiveStreamServer? = null
+        var session: StreamSession? = null
         var error: String? = null
         val audio = getSystemService(AudioManager::class.java)
         val phone = PhoneQuiet(
@@ -147,10 +153,11 @@ class PhoneStreamService : Service() {
         try {
             power.acquire(12 * 60 * 60 * 1000L)
             wifi.acquire()
-            server = LiveStreamServer(TestSound.localAddressFor(devices.first().ip))
+            session = StreamSession(devices, SyncStore(this), { stopped }, PhoneStream::setLine)
+            PhoneStream.session = session
             record = capture(projection)
             record.startRecording()
-            val s = server
+            val s = session
             val r = record
             val capture = Thread {
                 val buf = ByteArray(CHUNK)
@@ -160,12 +167,11 @@ class PhoneStreamService : Service() {
                     if (n > 0) {
                         s.push(buf.copyOf(n))
                         quiet.feed(buf, n)?.let(PhoneStream::hearing)
-                        phone.feed(isLoud(buf, n), SystemClock.elapsedRealtime())
+                        phone.feed(Pcm.isLoud(buf, n), SystemClock.elapsedRealtime())
                     } else if (n < 0) break
                 }
             }.also { it.start() }
-            val players = devices.mapIndexed { i, d -> Thread { play(i, d, s.url) }.also { it.start() } }
-            players.forEach { it.join() }   // ends on Stop, or once every speaker has failed
+            s.run()   // ends on Stop, or once every speaker has stopped or failed
             stopped = true
             capture.join(1000)
         } catch (e: Exception) {
@@ -175,37 +181,14 @@ class PhoneStreamService : Service() {
             runCatching { phone.release() }   // the phone plays out loud again
             runCatching { record?.stop() }
             record?.release()
-            server?.close()
+            PhoneStream.session = null
+            session?.close()
             projection.stop()
             if (wifi.isHeld) wifi.release()
             if (power.isHeld) power.release()
             PhoneStream.ended(error)
             Handler(mainLooper).post { finish() }
         }
-    }
-
-    /** Streams to one speaker until stopped; its status line says how it went. */
-    private fun play(i: Int, d: Device, url: String) {
-        val say = { msg: String -> PhoneStream.setLine(i, "${d.name}: $msg") }
-        val cast = d.protocols["googlecast"]
-        val result = runCatching {
-            if (cast != null) {
-                CastPlayer(d.ip, if (cast.port > 0) cast.port else 8009)
-                    .stream(url, LiveStreamServer.CONTENT_TYPE, PhoneStream.TITLE, say) { stopped }
-            } else {
-                val location = TestSound.dlnaLocation(d)
-                require(location.isNotEmpty()) { "this speaker only offers AirPlay, which SpeakerBridge can't send to yet" }
-                try {
-                    say("Starting the stream over DLNA…")
-                    DlnaPlayer.play(location, url, LiveStreamServer.CONTENT_TYPE, PhoneStream.TITLE, StartGate(1).party())
-                    say("Streaming over DLNA.")
-                    while (!stopped) Thread.sleep(250)
-                } finally {
-                    runCatching { DlnaPlayer.stop(location) }
-                }
-            }
-        }
-        say(result.fold({ "stopped." }, { "couldn't stream: ${it.message ?: it.javaClass.simpleName}" }))
     }
 
     @SuppressLint("NewApi")   // only reached on Android 10+
@@ -221,10 +204,10 @@ class PhoneStreamService : Service() {
             .build()
         val format = AudioFormat.Builder()
             .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
-            .setSampleRate(LiveStreamServer.RATE)
+            .setSampleRate(Pcm.RATE)
             .setChannelMask(AudioFormat.CHANNEL_IN_STEREO)
             .build()
-        val min = AudioRecord.getMinBufferSize(LiveStreamServer.RATE, AudioFormat.CHANNEL_IN_STEREO, AudioFormat.ENCODING_PCM_16BIT)
+        val min = AudioRecord.getMinBufferSize(Pcm.RATE, AudioFormat.CHANNEL_IN_STEREO, AudioFormat.ENCODING_PCM_16BIT)
         return AudioRecord.Builder()
             .setAudioFormat(format)
             .setBufferSizeInBytes(maxOf(min * 4, CHUNK * 10))
@@ -256,7 +239,7 @@ class PhoneStreamService : Service() {
     private companion object {
         const val CHANNEL = "stream"
         const val NOTIFICATION_ID = 1
-        const val CHUNK = LiveStreamServer.RATE * LiveStreamServer.CHANNELS * 2 / 50   // 20 ms
+        const val CHUNK = Pcm.CHUNK
     }
 }
 
@@ -265,12 +248,12 @@ class PhoneStreamService : Service() {
  * is reaching the speakers (nothing playing, or an app that doesn't allow its sound to be
  * shared). feed() returns the new answer when it changes, else null.
  */
-internal class SilenceWatch(private val rate: Int = LiveStreamServer.RATE, private val channels: Int = LiveStreamServer.CHANNELS) {
+internal class SilenceWatch(private val rate: Int = Pcm.RATE, private val channels: Int = Pcm.CHANNELS) {
     private var silentBytes = 0L
     private var answer: Boolean? = null
 
     fun feed(pcm: ByteArray, n: Int): Boolean? {
-        val loud = isLoud(pcm, n)
+        val loud = Pcm.isLoud(pcm, n)
         silentBytes = if (loud) 0 else silentBytes + n
         val now = when {
             loud -> true
@@ -283,17 +266,6 @@ internal class SilenceWatch(private val rate: Int = LiveStreamServer.RATE, priva
     private companion object {
         const val QUIET_SECONDS = 3
     }
-}
-
-/** Whether 16-bit little-endian PCM has any real sound in it (not just silence or dither). */
-internal fun isLoud(pcm: ByteArray, n: Int): Boolean {
-    var i = 0
-    while (i + 1 < n) {
-        val v = (pcm[i].toInt() and 0xff) or (pcm[i + 1].toInt() shl 8)
-        if (v > 64 || v < -64) return true   // of 32767: well below anything audible, above dither
-        i += 2
-    }
-    return false
 }
 
 /**

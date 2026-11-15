@@ -1,7 +1,5 @@
 package com.speakerbridge.playback
 
-import org.json.JSONArray
-import org.json.JSONObject
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -9,79 +7,22 @@ import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Assert.fail
 import org.junit.Test
-import java.io.DataInputStream
-import java.io.DataOutputStream
-import java.io.File
-import java.net.InetAddress
-import java.security.KeyStore
 import java.util.concurrent.CopyOnWriteArrayList
-import javax.net.ssl.KeyManagerFactory
-import javax.net.ssl.SSLContext
-import javax.net.ssl.SSLServerSocket
-
-/** A fake Cast receiver, like a TV, that loads a stream PAUSED and plays only when told to. */
-private class FakeReceiver(private val playsOnPlay: Boolean) : Thread() {
-    val events = CopyOnWriteArrayList<String>()
-    val server: SSLServerSocket
-    var playSessionId = -1
-
-    init {
-        isDaemon = true
-        val dir = File.createTempFile("cast", "").apply { delete(); mkdirs() }
-        val ks = File(dir, "k.p12")
-        val keytool = File(System.getProperty("java.home"), "bin/keytool").path
-        ProcessBuilder(keytool, "-genkeypair", "-alias", "tv", "-keyalg", "RSA", "-keysize", "2048",
-            "-dname", "CN=fake-tv", "-validity", "1", "-storetype", "PKCS12", "-keystore", ks.path,
-            "-storepass", "secret", "-keypass", "secret").redirectErrorStream(true).start().waitFor()
-        val store = KeyStore.getInstance("PKCS12").apply { ks.inputStream().use { load(it, "secret".toCharArray()) } }
-        val kmf = KeyManagerFactory.getInstance(KeyManagerFactory.getDefaultAlgorithm()).apply { init(store, "secret".toCharArray()) }
-        val ctx = SSLContext.getInstance("TLS").apply { init(kmf.keyManagers, null, null) }
-        server = ctx.serverSocketFactory.createServerSocket(0, 1, InetAddress.getLoopbackAddress()) as SSLServerSocket
-    }
-
-    override fun run() {
-        runCatching {
-            server.accept().use { c ->
-                val input = DataInputStream(c.getInputStream())
-                val out = DataOutputStream(c.getOutputStream())
-                fun send(src: String, ns: String, payload: JSONObject) {
-                    val b = CastPlayer.encode(src, "sender-0", ns, payload.toString())
-                    out.writeInt(b.size); out.write(b); out.flush()
-                }
-                fun media(state: String) = JSONObject().put("type", "MEDIA_STATUS")
-                    .put("status", JSONArray().put(JSONObject().put("playerState", state).put("mediaSessionId", 7)))
-                while (true) {
-                    val m = CastPlayer.decode(ByteArray(input.readInt()).also { input.readFully(it) })
-                    val p = JSONObject(m.payload)
-                    val type = p.optString("type")
-                    events += type
-                    when (type) {
-                        "LAUNCH" -> send("receiver-0", CastPlayer.NS_RECEIVER, JSONObject().put("type", "RECEIVER_STATUS")
-                            .put("status", JSONObject().put("applications", JSONArray().put(
-                                JSONObject().put("appId", CastPlayer.APP_ID).put("transportId", "web-1").put("sessionId", "S1")))))
-                        "LOAD" -> send("web-1", CastPlayer.NS_MEDIA, media("PAUSED"))   // ignores autoplay
-                        "PLAY" -> {
-                            playSessionId = p.optInt("mediaSessionId", -1)
-                            if (playsOnPlay) send("web-1", CastPlayer.NS_MEDIA, media("PLAYING"))
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
 
 class CastStreamTest {
     private val oldTimeout = CastPlayer.PLAY_TIMEOUT_MS
 
     @After fun restore() { CastPlayer.PLAY_TIMEOUT_MS = oldTimeout }
 
-    private fun stream(tv: FakeReceiver, steps: MutableList<String>, stopAfterStreaming: Boolean = true): Throwable? {
+    /** A TV that loads a stream paused and plays only when told to, or never. */
+    private fun pausedTv(playsOnPlay: Boolean) = FakeCast(loadState = "PAUSED", playsOnPlay = playsOnPlay).also { it.start() }
+
+    private fun stream(tv: FakeCast, steps: MutableList<String>, stopAfterStreaming: Boolean = true): Throwable? {
         var error: Throwable? = null
         val t = Thread {
             error = runCatching {
                 CastPlayer("127.0.0.1", tv.server.localPort).stream("http://127.0.0.1:1/x.wav", "audio/wav", "t",
-                    { steps += it }) { stopAfterStreaming && "Streaming." in steps }
+                    { steps += it }, stopped = { stopAfterStreaming && "Streaming." in steps })
             }.exceptionOrNull()
         }
         t.start()
@@ -91,7 +32,7 @@ class CastStreamTest {
     }
 
     @Test fun aTvThatLoadsPausedIsToldToPlayAndOnlyThenCountsAsStreaming() {
-        val tv = FakeReceiver(playsOnPlay = true).also { it.start() }
+        val tv = pausedTv(playsOnPlay = true)
         val steps = CopyOnWriteArrayList<String>()
         assertNull(stream(tv, steps))
         assertTrue("PLAY" in tv.events)
@@ -102,9 +43,10 @@ class CastStreamTest {
 
     @Test fun aTvThatNeverPlaysIsReportedNotCalledStreaming() {
         CastPlayer.PLAY_TIMEOUT_MS = 1500
-        val tv = FakeReceiver(playsOnPlay = false).also { it.start() }
+        val tv = pausedTv(playsOnPlay = false)
         val steps = CopyOnWriteArrayList<String>()
         val e = stream(tv, steps, stopAfterStreaming = false) ?: run { fail("expected an error"); return }
+        assertTrue(e is NeverPlayed)   // so another route can be tried
         assertTrue(e.message, "won't play it" in e.message.orEmpty())
         assertTrue("it stayed paused" in e.message.orEmpty())
         assertFalse("Streaming." in steps)
