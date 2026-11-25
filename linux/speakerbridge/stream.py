@@ -29,6 +29,7 @@ from typing import Callable, Iterable, Iterator
 
 from . import drift
 from .cast import NS_MEDIA, NS_RECEIVER, APP_ID, CastError, CastSession
+from . import dlna
 from .dlna import DlnaError, DlnaRenderer
 
 RATE, CHANNELS = 48000, 2
@@ -43,6 +44,54 @@ class StreamError(Exception):
     pass
 
 
+@dataclass(frozen=True)
+class Form:
+    """One way the live audio is offered. Speakers differ in what they'll play: many DLNA TVs
+    (LG webOS among them) take uncompressed audio only as raw "L16" PCM, not as a WAV file,
+    and a few want to be told a length."""
+    name: str
+    ext: str
+    content_type: str
+    sized: bool = False
+
+    @property
+    def dlna_features(self) -> str:
+        """The DLNA description of this stream (4th field of protocolInfo, contentFeatures header)."""
+        return (("DLNA.ORG_PN=LPCM;" if self.ext == "l16" else "") +
+                "DLNA.ORG_OP=00;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000")
+
+
+L16 = Form("L16", "l16", "audio/L16;rate=48000;channels=2")
+WAV = Form("WAV", "wav", "audio/wav")
+L16_SIZED = Form("L16 with a length", "l16", L16.content_type, sized=True)
+WAV_SIZED = Form("WAV with a length", "wav", WAV.content_type, sized=True)
+MP3 = Form("MP3", "mp3", "audio/mpeg")
+FORMS = {f.name: f for f in (L16, WAV, L16_SIZED, WAV_SIZED, MP3)}
+SIZED_LENGTH = 100_000_000_000   # what a "sized" stream claims: far more than anyone will play
+
+
+def swapped(b: bytes) -> bytes:
+    """16-bit samples with their bytes swapped: L16 is big-endian, the capture is little-endian."""
+    a = array("h", b[: len(b) // 2 * 2])
+    a.byteswap()
+    return a.tobytes()
+
+
+class SpeakerStats:
+    """What one speaker has done with its stream so far."""
+
+    def __init__(self):
+        self.open = 0          # connections open now
+        self.connections = 0   # connections ever
+        self.bytes = 0
+        self.last_write = 0.0
+
+    def flowing(self, now: float | None = None) -> bool:
+        """True while the speaker is connected and has taken audio within the last 1.5 s."""
+        now = time.monotonic() if now is None else now
+        return self.open > 0 and self.bytes > 0 and now - self.last_write < 1.5
+
+
 @dataclass
 class Target:
     """A speaker to stream to and how to reach it."""
@@ -53,6 +102,7 @@ class Target:
     location: str = ""   # DLNA description URL
     key: str = ""        # Device.key, for saving this speaker's delay
     delay_ms: int = 0    # sync delay; may be changed while streaming
+    route: str = ""      # the DLNA form (Form.name) that worked last time, to try first
 
 
 def target_for(dev) -> Target | None:
@@ -255,7 +305,8 @@ class Timeline:
 class LiveServer:
     """Serves one live audio stream over HTTP on a LAN address; every listener gets 'now'.
 
-    Speaker N fetches /N/speakerbridge.wav and hears it delay_ms(N) later, so a speaker
+    Speaker N fetches /N/speakerbridge.wav (or .l16, or under /sized/ for a stream that
+    declares a length; see Form) and hears it delay_ms(N) later, so a speaker
     that plays early can wait for slower ones. A speaker starts playing once it has buffered
     a fixed amount and then keeps its own clock, so only holding audio back *before* it starts
     adds delay. A change mid-stream is made by inserting silence or skipping audio instead
@@ -268,7 +319,9 @@ class LiveServer:
         self.fmt = fmt
         self.content_type = "audio/wav" if fmt == "wav" else "audio/mpeg"
         self.path = f"/speakerbridge.{fmt}"
-        self._route = re.compile(rf"^(?:/(\d+))?{re.escape(self.path)}$")
+        exts = "wav|l16" if fmt == "wav" else "mp3"
+        self._route = re.compile(rf"^(?:/(\d+))?(/sized)?/speakerbridge\.({exts})$")
+        self.stats: dict[int, SpeakerStats] = {}
         self._listeners: list[queue.Queue] = []
         self._lock = threading.Lock()
         self.timelines: dict[int, Timeline] = {}   # latest connection of each speaker
@@ -284,7 +337,14 @@ class LiveServer:
             def do_GET(self):
                 if not self._headers():
                     return
-                n = server._route.match(self.path.split("?")[0]).group(1)
+                n, sized, ext = server._route.match(self.path.split("?")[0]).groups()
+                l16 = ext == "l16"
+                st = server.stat(int(n)) if n is not None else SpeakerStats()
+
+                def send(b: bytes) -> None:
+                    self.wfile.write(swapped(b) if l16 else b)
+                    st.bytes += len(b)
+                    st.last_write = time.monotonic()
 
                 def delay() -> int:
                     try:   # any LAN device can ask for any number; unknown ones get no delay
@@ -298,9 +358,11 @@ class LiveServer:
                     server._listeners.append(q)
                     if n is not None:
                         server.timelines[int(n)] = tl
+                    st.open += 1
+                    st.connections += 1
                 wav = server.fmt == "wav"
                 try:
-                    if wav:
+                    if wav and not l16:
                         self.wfile.write(wav_header())
                     held, skip, fade_in = delay(), 0, False
                     while True:
@@ -325,10 +387,10 @@ class LiveServer:
                             if change:
                                 b = fade(b, out=True)
                             tl.add(len(b), captured)
-                            self.wfile.write(b)
+                            send(b)
                         if change > 0:
                             tl.add(change * BYTES_PER_MS, None)
-                            self.wfile.write(bytes(change * BYTES_PER_MS))
+                            send(bytes(change * BYTES_PER_MS))
                         elif change < 0:
                             skip += -change * BYTES_PER_MS
                         if change:
@@ -341,15 +403,23 @@ class LiveServer:
                     with server._lock:
                         if q in server._listeners:
                             server._listeners.remove(q)
+                        st.open -= 1
 
             def _headers(self) -> bool:
-                if not server._route.match(self.path.split("?")[0]):
+                m = server._route.match(self.path.split("?")[0])
+                if not m:
                     self.send_error(404)
                     return False
+                _n, sized, ext = m.groups()
+                form = {"l16": L16, "wav": WAV, "mp3": MP3}[ext]
                 self.send_response(200)
-                self.send_header("Content-Type", server.content_type)
+                self.send_header("Content-Type", form.content_type)
+                if sized:
+                    self.send_header("Content-Length", str(SIZED_LENGTH))
                 self.send_header("Cache-Control", "no-cache")
                 self.send_header("Access-Control-Allow-Origin", "*")
+                self.send_header("transferMode.dlna.org", "Streaming")
+                self.send_header("contentFeatures.dlna.org", form.dlna_features)
                 self.end_headers()
                 return True
 
@@ -366,9 +436,16 @@ class LiveServer:
         with self._lock:
             return self.timelines.get(n)
 
-    def url_for(self, n: int) -> str:
-        """The stream URL for speaker n, which gets delay_ms(n)."""
-        return self.url.replace(self.path, f"/{n}{self.path}", 1)
+    def stat(self, n: int) -> SpeakerStats:
+        with self._lock:
+            return self.stats.setdefault(n, SpeakerStats())
+
+    def url_for(self, n: int, form: Form | None = None) -> str:
+        """The stream URL for speaker n, which gets delay_ms(n), in the given form (default: the
+        server's own, WAV or MP3)."""
+        if form is None:
+            return self.url.replace(self.path, f"/{n}{self.path}", 1)
+        return self.url.replace(self.path, f"/{n}{'/sized' if form.sized else ''}/speakerbridge.{form.ext}", 1)
 
     def _pump(self, source: Iterable[bytes]) -> None:
         for b in source:
@@ -419,14 +496,19 @@ class _Link:
     heard: str                              # extra words for the "Streaming." message
     monitor: drift.DriftMonitor | None      # None for MP3, which can't take corrections
     playing: Callable[[], None]             # call once the speaker has started playing
+    form_url: Callable[[Form], str] = lambda f: ""   # its stream URL in another form (DLNA)
+    stats: SpeakerStats | None = None       # whether it is taking audio (DLNA)
+    worked: Callable[[str], None] = lambda name: None   # the DLNA form that played, to remember
 
 
 def run(targets: list[Target], stop: threading.Event, source: Iterable[bytes] | None = None,
-        fmt: str = "wav", on_status=print, on_playing: Callable[[Target], None] = lambda t: None) -> list[str]:
+        fmt: str = "wav", on_status=print, on_playing: Callable[[Target], None] = lambda t: None,
+        on_route: Callable[[str, str], None] = lambda key, form: None) -> list[str]:
     """Streams to every target at once until `stop` is set or every speaker has stopped.
     Blocking. A speaker that fails doesn't stop the others; returns their error messages
     (raises StreamError if none could play). `source` replaces the PipeWire capture (sync
-    clicks, microphone calibration, tests). on_playing(target) is called as each one starts."""
+    clicks, microphone calibration, tests). on_playing(target) is called as each one starts;
+    on_route(key, form name) when a DLNA speaker plays, so the form can be tried first next time."""
     if not targets:
         raise StreamError("no speakers to stream to")
     bind_ip = local_ip_for(targets[0].host)
@@ -449,7 +531,8 @@ def run(targets: list[Target], stop: threading.Event, source: Iterable[bytes] | 
                 monitor = (drift.DriftMonitor(lambda: server.timeline(n), say_t, BYTES_PER_MS * 1000)
                            if fmt == "wav" else None)
                 link = _Link(t, server.url_for(n), server.content_type, stop, say_t, heard, monitor,
-                             lambda: on_playing(t))
+                             lambda: on_playing(t), lambda f: server.url_for(n, f), server.stat(n),
+                             lambda name: on_route(t.key, name) if t.key else None)
                 (_play_cast if t.protocol == "googlecast" else _play_dlna)(link)
             except (StreamError, CastError, DlnaError, OSError) as exc:
                 if len(targets) == 1:
@@ -514,26 +597,90 @@ def _play_cast(link: _Link) -> None:
         session.close()
 
 
+CONFIRM_TIMEOUT_S = 15.0   # how long a DLNA speaker gets to start playing one form before the next is tried
+IDLE_GRACE_S = 5.0         # sitting idle, taking no audio, this long after Play: it gave up on that form
+_IDLE = {"STOPPED", "NO_MEDIA_PRESENT"}
+
+
+def _confirm(renderer: DlnaRenderer, link: _Link) -> bool:
+    """Waits until the speaker really is playing: it says so (when it reports its state) and it
+    has taken audio steadily for two seconds. False if it reports an error, sits idle without
+    taking audio, or the time runs out."""
+    st, start, flowing_since = link.stats, time.monotonic(), 0.0
+    while not link.stop.is_set():
+        now = time.monotonic()
+        info = renderer.transport()
+        state = info[0] if info else ""
+        if info and info[1] == "ERROR_OCCURRED":
+            return False
+        flowing_since = 0.0 if not st.flowing(now) else (flowing_since or now)
+        if flowing_since and now - flowing_since >= 2 and (info is None or state == "PLAYING"):
+            return True
+        if now - start > IDLE_GRACE_S and state in _IDLE and not st.flowing(now):
+            return False
+        if now - start > CONFIRM_TIMEOUT_S:
+            return False
+        link.stop.wait(0.4)
+    return True
+
+
 def _play_dlna(link: _Link) -> None:
     say, mon = link.say, link.monitor
     say("Connecting to the speaker over DLNA…")
     renderer = DlnaRenderer(link.target.location)
+    if link.content_type == MP3.content_type:
+        forms = [MP3]
+    else:   # work through the forms until one really plays, the one that worked last time first
+        forms = [FORMS[n] for n in dlna.order(renderer.sinks())]
+        remembered = FORMS.get(link.target.route)
+        if remembered in forms:
+            forms.remove(remembered)
+            forms.insert(0, remembered)
+    tried, failure = [], "no way to reach it"
     try:
-        renderer.play(link.url, link.content_type, TITLE)
+        for form in forms:
+            if link.stop.is_set():
+                return
+            tried.append(form.name)
+            if len(forms) > 1:
+                say(f"Starting the stream over DLNA ({form.name})…")
+            renderer.stop()   # some renderers only accept a new URL from an idle transport
+            try:
+                renderer.set_uri(link.form_url(form), form.content_type, form.dlna_features, TITLE)
+                renderer.soap("Play", "<Speed>1</Speed>")
+            except DlnaError as exc:
+                failure = str(exc)   # refused outright: straight on to the next form
+                continue
+            if _confirm(renderer, link):
+                break
+            failure = "it took the stream but didn't play it"
+        else:
+            raise DlnaError(failure + (f" (tried {'; '.join(tried)})" if len(tried) > 1 else ""))
+        if link.stop.is_set():
+            return
+        link.worked(form.name)
         say("Streaming over DLNA." + link.heard)
         link.playing()
-        started, answered = time.monotonic(), False
-        while not link.stop.wait(random.uniform(*drift.DLNA_POLL_S) if mon and mon.enabled else None):
-            t0 = time.monotonic()
-            pos = renderer.position()
-            t1 = time.monotonic()
-            if pos is not None:
-                answered = True
-                mon.sample((t0 + t1) / 2, pos[0], whole_seconds=pos[1], half_rtt=(t1 - t0) / 2)
-            elif not answered and t1 - started > drift.WARMUP_S:
-                mon.enabled = False
-                say("Can't keep this speaker in sync automatically: it doesn't report how far "
-                    "it has played.")
+        started, answered, idle, next_check = time.monotonic(), False, 0, 0.0
+        while not link.stop.wait(random.uniform(*drift.DLNA_POLL_S)):
+            if mon and mon.enabled:
+                t0 = time.monotonic()
+                pos = renderer.position()
+                t1 = time.monotonic()
+                if pos is not None:
+                    answered = True
+                    mon.sample((t0 + t1) / 2, pos[0], whole_seconds=pos[1], half_rtt=(t1 - t0) / 2)
+                elif not answered and t1 - started > drift.WARMUP_S:
+                    mon.enabled = False
+                    say("Can't keep this speaker in sync automatically: it doesn't report how far "
+                        "it has played.")
+            if time.monotonic() >= next_check:   # notice it being stopped from its own remote
+                next_check = time.monotonic() + 3
+                info = renderer.transport()
+                idle = idle + 1 if info and info[0] in _IDLE and not link.stats.flowing() else 0
+                if idle >= 2:
+                    raise StreamError("the speaker stopped the stream (stopped from elsewhere, or it "
+                                      "lost the connection)")
     finally:
         renderer.stop()
 
