@@ -4,6 +4,10 @@ plugins {
     id("org.jetbrains.kotlin.plugin.compose")
 }
 
+// A permanent signing key, when the build is given one (see scripts/make-signing-key.sh), so each
+// new build installs over the last. Without it, Android's throwaway debug key is used.
+val signingKeystore: String? = System.getenv("SB_KEYSTORE")?.takeIf { it.isNotEmpty() }
+
 android {
     namespace = "com.speakerbridge"
     compileSdk = 35
@@ -12,8 +16,18 @@ android {
         applicationId = "com.speakerbridge"
         minSdk = 26
         targetSdk = 35
-        versionCode = 1
-        versionName = "0.1.0"
+        // The CI run number, so every build counts as newer than the one before.
+        versionCode = System.getenv("SB_BUILD")?.toIntOrNull() ?: 1
+        versionName = "0.5." + (System.getenv("SB_BUILD")?.toIntOrNull() ?: 0)
+    }
+
+    signingConfigs {
+        if (signingKeystore != null) create("permanent") {
+            storeFile = file(signingKeystore)
+            storePassword = System.getenv("SB_KEYSTORE_PASSWORD")
+            keyAlias = "speakerbridge"
+            keyPassword = System.getenv("SB_KEYSTORE_PASSWORD")
+        }
     }
 
     // The shared compatibility database is bundled straight from the repo,
@@ -21,6 +35,9 @@ android {
     sourceSets["main"].assets.srcDirs("../../shared/compatibility")
 
     buildTypes {
+        debug {
+            if (signingKeystore != null) signingConfig = signingConfigs.getByName("permanent")
+        }
         release {
             isMinifyEnabled = false
         }

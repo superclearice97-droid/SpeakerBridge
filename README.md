@@ -2,7 +2,7 @@
 
 Make Wi-Fi speakers from different brands (Sony, Vizio, Google Nest and others) play together, using only their built-in Wi-Fi. No adapters, no cloud, no subscription.
 
-**Current version: 0.1 — discovery.** It finds the speakers on your network, shows which wireless audio protocols each one supports, and tells you honestly whether SpeakerBridge will be able to send audio to it. Streaming arrives in 0.2.
+**Current version: 0.5.** It finds the speakers on your network and streams your phone's audio (Android) or your computer's audio (Linux) to several of them at once, over Google Cast or DLNA, kept in step with per-speaker sync delays and automatic drift correction. AirPlay isn't supported yet.
 
 **Test sound (Android):** tap a speaker, then **Play Test Sound**. The phone plays a short chime on it over Google Cast or DLNA (AirPlay not yet). On a Google Home speaker group, every member plays the chime together, in sync. Once you hear it, tap **I Heard It Play!** to mark the speaker Verified. To hear several speakers at once, tick them under **Play Together** on the main screen: SpeakerBridge loads the chime on each one, then starts them all at the same moment. Different brands can still land a fraction of a second apart (each buffers differently); a Google Home group remains the tightest sync for Cast speakers. The chime is generated on the phone and served only on your Wi-Fi; nothing leaves your network.
 
@@ -10,8 +10,17 @@ Make Wi-Fi speakers from different brands (Sony, Vizio, Google Nest and others) 
 
 - Apps can opt out of capture, and Android enforces that: many video apps (protected content) stream silence. SpeakerBridge doesn't work around it. While streaming, the app says whether it's sending sound or only silence.
 - Android copies the sound rather than moving it, so the phone would keep playing too, a second or two ahead of the speakers. SpeakerBridge mutes the phone's media volume once music starts and unmutes it when you stop. On a phone where muting also silences what's shared, it notices within two seconds, unmutes, and says so.
-- A speaker only shows "Streaming." once it's actually playing. Some TVs load the stream paused, so SpeakerBridge presses play for you; one that still won't play is reported (it may not support this kind of audio stream).
-- Speakers buffer a second or two, so it suits music rather than video. Separate speakers, especially Cast and DLNA ones mixed, can be noticeably apart; the sync delay and drift correction from the Linux app aren't on Android yet. Speakers in one Google Home group stay in sync.
+- A speaker only shows "Streaming." once it's actually playing. Speakers differ in the audio they accept, so SpeakerBridge works through the ways it could reach each one until one plays: Google Cast first (pressing play for TVs that load paused), then DLNA as raw L16 audio (the form many TVs, LG webOS among them, require) or as WAV, each with or without a declared length, in the order the speaker says it prefers. The one that works is remembered for next time. If nothing works, it says so and lists what it tried. Under each picked speaker, **Route** shows "auto"; tap it to choose one way yourself.
+- Speakers buffer a second or two, so it suits music rather than video. Speakers in one Google Home group stay in sync by themselves.
+
+**Keeping speakers in step (Android):** under each picked speaker, **Delay** holds that speaker back (−100 / −10 / +10 / +100 ms) so it waits for slower ones. Delays are saved and change straight away while music plays. To work them out:
+
+- **Line up with microphone** (two or more speakers): asks first, every time. Put the phone where you listen, keep the room quiet and the screen open. Each speaker plays clicks for about 15 seconds while the phone's microphone listens, then the delays are set for you.
+- **Play sync clicks:** a click a second on every picked speaker. Raise the delay of the speaker that clicks first until you hear one click.
+
+While streaming, each speaker is also kept in step automatically (drift correction): its clock runs very slightly fast or slow, so SpeakerBridge checks how far it has played and inserts or skips a few ms when it slides. The occasional "Nudged +15 ms" line is that. A speaker that doesn't report its position is left alone, and the app says so.
+
+**If a speaker won't play:** tap **Copy report** and send it to whoever looks after the app (or paste it into an issue). It lists what each speaker was offered, what it asked for and how it answered: speaker names, models and local addresses, no audio. It's only copied to your clipboard, never sent anywhere by the app.
 - It's for your own listening at home. Music and video services have their own terms about where their content may be played.
 
 ---
@@ -81,7 +90,9 @@ If nothing is found, run `./scripts/diagnose-audio.sh`. It checks multicast, fir
 
 ### Android
 
-**From your phone (no computer needed):** push this folder to a GitHub repository. The included workflow (`.github/workflows/android-apk.yml`) builds the APK in the cloud on every push and publishes it on the repo's **Releases** page. Open that page on your phone, tap the `.apk`, and allow installing from your browser when Android asks.
+**From your phone (no computer needed):** push this folder to a GitHub repository. The included workflow (`.github/workflows/android-apk.yml`) builds the APK in the cloud on every push to `main` and publishes it on the repo's **Releases** page. Open that page on your phone, tap the `.apk`, and allow installing from your browser when Android asks.
+
+**Updates that install over the last version:** Android only installs an update over an app signed with the same key. Run `./scripts/make-signing-key.sh` once on your computer (it needs `keytool` and the GitHub CLI, signed in): it makes a private signing key, keeps it in `~/.config/speakerbridge/`, and gives it to GitHub as two repository secrets. From then on every build is signed with it, so updates install straight over the old app and keep your saved delays. Until then, each build is signed with a throwaway key and the old app has to be uninstalled first. Keep the key file safe; if it's lost, one more uninstall is needed.
 
 **With a computer:** open the `android/` folder in Android Studio and press **Run**, or **Build → Build APK(s)**.
 
@@ -99,9 +110,11 @@ SpeakerBridge has no account, no cloud service and no analytics. Everything it d
 
 - **Discovery** asks devices on your Wi-Fi what they are; it only fetches descriptions from local addresses.
 - **Streaming** serves your audio only to the speakers you chose, on your local network.
-- **Saved on this computer**, in `~/.config/speakerbridge/`: `verified.json` (speakers you marked as working) and `delays.json` (sync delays). Delete them any time.
-- **Android streaming** captures only the sound other apps play (Android's audio playback capture, which asks for your consent each time), keeps it in memory just long enough to send it to the speakers you picked on your Wi-Fi, and never saves or uploads it. Android requires the audio recording permission for this, but the microphone isn't used.
-- **Microphone (Linux):** used only when you start microphone calibration, and only after you agree each time. The recording is kept in memory just long enough to time the clicks, cleared after each speaker, and never saved or sent anywhere.
+- **Saved on this computer**, in `~/.config/speakerbridge/`: `verified.json` (speakers you marked as working), `delays.json` (sync delays) and `routes.json` (the form of stream each DLNA speaker played, to try first next time). Delete them any time.
+- **Saved on the phone**, in the app's own storage: speakers you marked as working, each speaker's sync delay, and the way of reaching it that worked (or that you picked). Clearing the app's storage or uninstalling deletes them.
+- **Android streaming** captures only the sound other apps play (Android's audio playback capture, which asks for your consent each time), keeps it in memory just long enough to send it to the speakers you picked on your Wi-Fi, and never saves or uploads it. Android requires the audio recording permission for this; streaming doesn't use the microphone.
+- **Microphone (Linux and Android):** used only when you start the microphone line-up, and only after you agree each time. The recording is kept in memory just long enough to time the clicks, cleared after each speaker, and never saved or sent anywhere.
+- **Copy report (Android)** puts a text summary of recent streams on your clipboard: speaker names, models, local addresses and how each answered. Nothing is sent; you decide whether to share it.
 
 ## What the statuses mean
 
@@ -142,7 +155,7 @@ The scanner flags this when it sees a non-Google speaker with Cast ("can join a 
 | 0.2 | Linux → Google Cast (single speakers and Cast groups) via an HTTP stream of PipeWire audio; AirPlay (RAOP) via PipeWire's built-in module | Cast streaming done; AirPlay next |
 | 0.3 | Multiple targets at once, saved groups, per-speaker volume | Linux: Cast + DLNA speakers at once done; saved groups and volume next |
 | 0.4 | Sync engine: delay calibration for DLNA / mixed targets, drift monitoring | Linux: done (sync delay by ear or microphone, drift correction) |
-| 0.5 | Android as an audio source (AudioPlaybackCapture, with your consent) | Streaming to Cast + DLNA speakers done; sync delay and drift correction next |
+| 0.5 | Android as an audio source (AudioPlaybackCapture, with your consent) | Done: Cast + DLNA (each speaker reached the way it plays), sync delay by ear or microphone, drift correction |
 | 0.6 | Sony / Vizio control APIs for volume and input, more DLNA devices | |
 | 1.0 | Stable release, APK + Linux package, docs | |
 
@@ -155,7 +168,7 @@ android/                 Kotlin + Jetpack Compose app (discovery, compat, UI)
 linux/speakerbridge/     Python package: mdns.py, ssdp.py, scanner.py, compat.py, cli.py, gui.py, cast.py, dlna.py, stream.py, drift.py, mic.py
 shared/compatibility/    compatibility.json, the protocol and brand database both apps use
 shared/device-model/     JSON schema for exported devices
-scripts/                 install-cachyos.sh, diagnose-audio.sh
+scripts/                 install-cachyos.sh, diagnose-audio.sh, make-signing-key.sh
 tests/                   Linux unit + loopback tests (python3 -m unittest discover -s tests)
 ```
 
@@ -169,5 +182,6 @@ tests/                   Linux unit + loopback tests (python3 -m unittest discov
 
 ```bash
 python3 -m unittest discover -s tests     # Linux: wire format, loopback mDNS/SSDP, classification, Cast + DLNA streaming, sync
-cd android && ./gradlew test               # Android: mDNS wire format + AirPlay 2 detection
+cd android && ./gradlew test               # Android: wire formats, stream server, sync, mic timing, and whole sessions
+                                           # against fake Cast / DLNA speakers (picky TVs, drift, mixed brands)
 ```

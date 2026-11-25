@@ -206,9 +206,13 @@ class StreamSessionTest {
         DriftMonitor.PRECISE_MAX_SPREAD_S = 0.1
     }
 
+    /** Seconds between clicks as the speaker played them, after the starting point is taken. A
+     *  correction that skips audio can land on a click and drop it, so clicks are counted by
+     *  elapsed time rather than by how many were heard. */
     private fun interval(p: FakePlayer): Double {
-        val heard = p.heard.filter { it - p.tStart > 3 }   // after the starting point is taken
-        return (heard.last() - heard.first()) / (heard.size - 1)
+        val heard = p.heard.filter { it - p.tStart > 3 }
+        val span = heard.last() - heard.first()
+        return span / Math.round(span)
     }
 
     @Test fun driftIsCorrectedOnALiveCastSpeaker() {

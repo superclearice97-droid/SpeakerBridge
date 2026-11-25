@@ -17,6 +17,8 @@ jobs:
     defaults:
       run:
         working-directory: android
+    env:
+      SB_BUILD: ${{ github.run_number }}
     steps:
       - uses: actions/checkout@v4
 
@@ -27,7 +29,24 @@ jobs:
 
       - uses: gradle/actions/setup-gradle@v4
 
+      # Signs with your permanent key when the two secrets exist (scripts/make-signing-key.sh sets
+      # them), so each build installs over the last. Otherwise Android's throwaway key is used.
+      - name: Signing key
+        id: signing
+        env:
+          KEYSTORE_B64: ${{ secrets.SIGNING_KEYSTORE_B64 }}
+        run: |
+          if [ -n "$KEYSTORE_B64" ]; then
+            printf '%s' "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/signing.p12"
+            echo "SB_KEYSTORE=$RUNNER_TEMP/signing.p12" >> "$GITHUB_ENV"
+            echo "note=Signed with this project's permanent key: it installs straight over an earlier build signed the same way." >> "$GITHUB_OUTPUT"
+          else
+            echo "note=Signed with a throwaway key: uninstall the old SpeakerBridge before installing this one. (Run scripts/make-signing-key.sh once to avoid that.)" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Build APK
+        env:
+          SB_KEYSTORE_PASSWORD: ${{ secrets.SIGNING_KEYSTORE_PASSWORD }}
         run: |
           chmod +x gradlew
           set +e
@@ -47,7 +66,7 @@ jobs:
           exit $rc
 
       - name: Rename APK
-        run: cp app/build/outputs/apk/debug/app-debug.apk "SpeakerBridge-0.1-build${{ github.run_number }}.apk"
+        run: cp app/build/outputs/apk/debug/app-debug.apk "SpeakerBridge-0.5-build${{ github.run_number }}.apk"
 
       - uses: actions/upload-artifact@v4
         with:
@@ -58,7 +77,10 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: build-${{ github.run_number }}
-          name: SpeakerBridge 0.1 (build ${{ github.run_number }})
-          body: Debug build of the Android app. Download the .apk on your phone and open it to install.
+          name: SpeakerBridge 0.5 (build ${{ github.run_number }})
+          body: |
+            The Android app. Download the .apk on your phone and open it to install.
+
+            ${{ steps.signing.outputs.note }}
           prerelease: true
           files: android/SpeakerBridge-*.apk
