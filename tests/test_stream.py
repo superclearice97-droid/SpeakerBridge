@@ -86,6 +86,49 @@ def runs(values):
 OPEN = urllib.request.build_opener(urllib.request.ProxyHandler({})).open
 
 
+class StreamFormTests(unittest.TestCase):
+    def test_l16_is_raw_big_endian_audio_with_the_dlna_profile(self):
+        srv = stream.LiveServer(numbered(), "127.0.0.1")
+        try:
+            with OPEN(srv.url_for(0, stream.L16), timeout=5) as r:
+                self.assertEqual(r.headers["Content-Type"], "audio/L16;rate=48000;channels=2")
+                self.assertIn("DLNA.ORG_PN=LPCM", r.headers["contentFeatures.dlna.org"])
+                self.assertEqual(r.headers["transferMode.dlna.org"], "Streaming")
+                self.assertIsNone(r.headers["Content-Length"])
+                data = r.read(stream.CHUNK)
+            back = stream.swapped(data)   # swapping each sample's bytes again gives the original audio
+            ids = {struct.unpack_from("<I", back, k)[0] for k in range(0, len(back), 4)}
+            self.assertEqual(len(ids), 1)    # no WAV header in front: the first bytes are already audio
+            self.assertNotIn(0, ids)
+            self.assertNotEqual(data, back)  # and it really was byte-swapped
+        finally:
+            srv.close()
+
+    def test_sized_forms_declare_a_length(self):
+        srv = stream.LiveServer(silence(), "127.0.0.1")
+        try:
+            for form in (stream.WAV_SIZED, stream.L16_SIZED):
+                req = urllib.request.Request(srv.url_for(2, form), method="HEAD")
+                with OPEN(req, timeout=5) as r:
+                    self.assertEqual(r.headers["Content-Length"], str(stream.SIZED_LENGTH), form)
+                    self.assertEqual(r.headers["Content-Type"], form.content_type)
+        finally:
+            srv.close()
+
+    def test_stats_show_whether_a_speaker_is_taking_audio(self):
+        srv = stream.LiveServer(silence(), "127.0.0.1")
+        try:
+            self.assertFalse(srv.stat(1).flowing())
+            with OPEN(srv.url_for(1, stream.L16), timeout=5) as r:
+                r.read(stream.CHUNK * 5)
+                self.assertTrue(srv.stat(1).flowing())
+                self.assertEqual(srv.stat(1).connections, 1)
+            time.sleep(0.5)
+            self.assertFalse(srv.stat(0).flowing())   # and another speaker's stats are its own
+        finally:
+            srv.close()
+
+
 class LiveServerTest(unittest.TestCase):
     def test_listener_gets_header_then_audio(self):
         srv = stream.LiveServer(silence(), "127.0.0.1")
@@ -204,7 +247,9 @@ class FakePlayer:
     def __init__(self, buffer_s=0.3, ppm=0.0):
         self.buffer_s, self.rate = buffer_s, 1 + ppm * 1e-6
         self.fetched, self.heard, self.t_start = b"", [], None
+        self.content_type = self.content_length = ""
         self.ready = threading.Event()
+        self._response = None
 
     def start(self, url):
         threading.Thread(target=self._play, args=(url,), daemon=True).start()
@@ -213,7 +258,11 @@ class FakePlayer:
     def _play(self, url):
         try:
             with OPEN(url, timeout=5) as r:
-                head, pos, quiet = r.read(44), 0, 10 ** 9
+                self._response = r
+                self.content_type = r.headers.get("Content-Type", "")
+                self.content_length = r.headers.get("Content-Length", "")
+                head = r.read(44) if self.content_type.startswith("audio/wav") else b""   # raw L16 has no header
+                pos, quiet = 0, 10 ** 9
                 while True:
                     b = r.read(stream.CHUNK)
                     if not b:
@@ -231,6 +280,14 @@ class FakePlayer:
                         quiet += len(b)
                     pos += len(b)
         except OSError:
+            pass
+
+    def stop(self):
+        """Hangs up, as a speaker does when told to stop."""
+        try:
+            if self._response is not None:
+                self._response.fp.raw._sock.shutdown(socket.SHUT_RDWR)
+        except (AttributeError, OSError):
             pass
 
     def position(self):
@@ -306,22 +363,32 @@ DESCRIPTION = """<?xml version="1.0"?>
       <service><serviceType>urn:schemas-upnp-org:service:RenderingControl:1</serviceType>
         <controlURL>/rc</controlURL></service>
       <service><serviceType>urn:schemas-upnp-org:service:AVTransport:1</serviceType>
-        <controlURL>upnp/av</controlURL></service>
+        <controlURL>upnp/av</controlURL></service>{cm}
     </serviceList></device>
 </root>"""
+CM = """
+      <service><serviceType>urn:schemas-upnp-org:service:ConnectionManager:1</serviceType>
+        <controlURL>/upnp/cm</controlURL></service>"""
 
 
 class FakeDlna:
-    """Serves a description and an AVTransport control URL; on Play it fetches the stream."""
+    """Serves a description and an AVTransport control URL; on Play it fetches the stream.
+    By default it plays anything. `plays(mime, sized)` makes it picky, like a TV that takes the
+    command and opens its player but only really plays some forms of the stream; `rejects(mime)`
+    makes it refuse a type outright; `sinks` is what it says it plays (and adds a
+    ConnectionManager to its description)."""
 
-    def __init__(self, reject: str = "", player=None, whole_seconds=True):
+    def __init__(self, reject: str = "", player=None, whole_seconds=True, sinks=None,
+                 plays=lambda mime, sized: True, rejects=lambda mime: False):
         self.actions, self.reject = [], reject
         self.player, self.whole_seconds = player or FakePlayer(), whole_seconds
+        self.sinks, self.plays, self.rejects = sinks, plays, rejects
+        self.offered, self.state, self.uri, self.mime = [], "NO_MEDIA_PRESENT", "", ""
         fake = self
 
         class Handler(BaseHTTPRequestHandler):
             def do_GET(self):
-                body = DESCRIPTION.format(port=fake.port).encode()
+                body = DESCRIPTION.format(port=fake.port, cm=CM if fake.sinks is not None else "").encode()
                 self.send_response(200)
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
@@ -331,16 +398,49 @@ class FakeDlna:
                 body = self.rfile.read(int(self.headers["Content-Length"])).decode()
                 action = self.headers["SOAPACTION"].strip('"').split("#")[1]
                 fake.actions.append(action)
-                if self.path != "/upnp/av" or action == fake.reject:
+                if self.path == "/upnp/cm" and action == "GetProtocolInfo":
+                    self.send_response(200)
+                    self.end_headers()
+                    self.wfile.write(f"<s:Envelope><s:Body><Sink>{fake.sinks}</Sink></s:Body></s:Envelope>".encode())
+                    return
+                refuse = action == "SetAVTransportURI" and fake.rejects(
+                    body.split("http-get:*:")[1].split(":")[0] if "http-get:*:" in body else "")
+                if self.path != "/upnp/av" or action == fake.reject or refuse:
+                    if action == "SetAVTransportURI":
+                        fake.offered.append(body.split("http-get:*:")[1].split(":DLNA")[0].split(":*")[0])
                     self.send_response(500)
                     self.end_headers()
                     self.wfile.write(b"<errorDescription>Not supported</errorDescription>")
                     return
                 if action == "SetAVTransportURI":
                     fake.uri = body.split("<CurrentURI>")[1].split("</CurrentURI>")[0]
+                    fake.mime = body.split("http-get:*:")[1].split(":DLNA")[0].split(":*")[0]
+                    fake.offered.append(fake.mime + ("|sized" if "/sized/" in fake.uri else "|live"))
+                    fake.state = "STOPPED"
                 if action == "Play":
-                    fake.player.start(fake.uri)
+                    if fake.plays(fake.mime, "/sized/" in fake.uri):
+                        fake.state = "PLAYING"
+                        threading.Thread(target=fake.player.start, args=(fake.uri,), daemon=True).start()
+                    else:   # opens its player, looks at the stream, can't play it, gives up
+                        fake.state = "TRANSITIONING"
+
+                        def give_up():
+                            try:
+                                with OPEN(fake.uri, timeout=3) as r:
+                                    r.read(2000)
+                            except OSError:
+                                pass
+                            time.sleep(0.3)
+                            fake.state = "STOPPED"
+                        threading.Thread(target=give_up, daemon=True).start()
+                if action == "Stop":
+                    fake.player.stop()
+                    if fake.state != "NO_MEDIA_PRESENT":
+                        fake.state = "STOPPED"
                 reply = b""
+                if action == "GetTransportInfo":
+                    reply = (f"<s:Envelope><s:Body><CurrentTransportState>{fake.state}</CurrentTransportState>"
+                             "<CurrentTransportStatus>OK</CurrentTransportStatus></s:Body></s:Envelope>").encode()
                 if action == "GetPositionInfo":
                     pos = fake.player.position()
                     whole = int(pos)
@@ -374,9 +474,12 @@ class FakeDlna:
 
 class DlnaTests(unittest.TestCase):
     def test_finds_av_transport_and_resolves_against_urlbase(self):
-        xml = DESCRIPTION.format(port=1234)
+        xml = DESCRIPTION.format(port=1234, cm=CM)
         self.assertEqual(dlna.av_transport(xml, "http://127.0.0.1:1234/desc.xml"),
                          ("urn:schemas-upnp-org:service:AVTransport:1", "http://127.0.0.1:1234/upnp/av"))
+        self.assertEqual(dlna.service(xml, "http://127.0.0.1:1234/desc.xml", "ConnectionManager"),
+                         ("urn:schemas-upnp-org:service:ConnectionManager:1", "http://127.0.0.1:1234/upnp/cm"))
+        self.assertIsNone(dlna.service(DESCRIPTION.format(port=1, cm=""), "http://127.0.0.1:1/", "ConnectionManager"))
 
     def test_no_av_transport_is_a_clear_error(self):
         with self.assertRaisesRegex(dlna.DlnaError, "no AVTransport"):
@@ -670,11 +773,11 @@ class StreamEndToEnd(unittest.TestCase):
                         "-subj", "/CN=fake-cast", "-keyout", f"{cls.tmp}/k.pem", "-out", f"{cls.tmp}/c.pem"],
                        check=True, capture_output=True)
 
-    def _run(self, targets, source, seconds=1.5):
+    def _run(self, targets, source, seconds=1.5, on_route=lambda key, form: None):
         stop = threading.Event()
         threading.Timer(seconds, stop.set).start()
         statuses = []
-        failures = stream.run(targets, stop, source=source, on_status=statuses.append)
+        failures = stream.run(targets, stop, source=source, on_status=statuses.append, on_route=on_route)
         time.sleep(0.3)
         return statuses, failures
 
@@ -717,7 +820,7 @@ esac
         fake, dlna_fake = FakeCast(self.tmp), FakeDlna()
         try:
             fake.start()
-            statuses, _ = self._run([self._cast_target(fake), dlna_fake.target()], None)
+            statuses, _ = self._run([self._cast_target(fake), dlna_fake.target()], None, seconds=4)
         finally:
             os.environ["PATH"] = old
             dlna_fake.close()
@@ -733,13 +836,13 @@ esac
     def test_streams_to_a_dlna_speaker_and_stops_it(self):
         fake = FakeDlna()
         try:
-            statuses, failures = self._run([fake.target()], silence())
+            statuses, failures = self._run([fake.target()], silence(), seconds=4)
         finally:
             fake.close()
-        self.assertEqual([a for a in fake.actions if a != "GetPositionInfo"],
+        self.assertEqual([a for a in fake.actions if a in ("Stop", "SetAVTransportURI", "Play")],
                          ["Stop", "SetAVTransportURI", "Play", "Stop"])
-        self.assertEqual(fake.fetched[:4], b"RIFF")
-        self.assertEqual(len(fake.fetched), 44 + stream.CHUNK)
+        self.assertTrue(fake.player.content_type.startswith("audio/L16"))   # raw L16 first: what TVs take
+        self.assertEqual(len(fake.fetched), stream.CHUNK)                    # no file header
         self.assertEqual(failures, [])
         self.assertTrue(any("Streaming over DLNA" in s for s in statuses))
 
@@ -747,14 +850,14 @@ esac
         cast_fake, dlna_fake = FakeCast(self.tmp), FakeDlna()
         cast_fake.start()
         try:
-            statuses, failures = self._run([self._cast_target(cast_fake), dlna_fake.target()], silence())
+            statuses, failures = self._run([self._cast_target(cast_fake), dlna_fake.target()], silence(), seconds=4)
         finally:
             dlna_fake.close()
         self.assertEqual(failures, [])
         self.assertEqual(cast_fake.fetched[:4], b"RIFF")
-        self.assertEqual(dlna_fake.fetched[:4], b"RIFF")
+        self.assertEqual(len(dlna_fake.fetched), stream.CHUNK)
         cast_url, dlna_url = cast_fake.load["media"]["contentId"], dlna_fake.uri
-        self.assertEqual(cast_url.replace("/0/", "/1/"), dlna_url)   # one server, a URL (and delay) each
+        self.assertEqual(cast_url.split("/0/")[0], dlna_url.split("/1/")[0])   # one server, a URL (and delay) each
         self.assertIn("STOP", cast_fake.events)
         self.assertEqual(dlna_fake.actions[-1], "Stop")
         self.assertTrue(any(s.startswith("Fake Nest: Streaming") for s in statuses))
@@ -767,7 +870,7 @@ esac
         nest, heos = self._cast_target(cast_fake), dlna_fake.target()
         heos.delay_ms = 400
         try:
-            statuses, _ = self._run([nest, heos], silence())
+            statuses, _ = self._run([nest, heos], silence(), seconds=3)
         finally:
             dlna_fake.close()
         self.assertIn("/0/", cast_fake.load["media"]["contentId"])
@@ -784,8 +887,11 @@ esac
         self.assertEqual(failures, [])
         intervals = []
         for pl in players:
-            heard = [h for h in pl.heard if h - pl.t_start > 3]   # after the starting point is taken
-            intervals.append((heard[-1] - heard[0]) / (len(heard) - 1))
+            # After the starting point is taken. A correction that skips audio can land on a click
+            # and drop it, so clicks are counted by elapsed time rather than by how many were heard.
+            heard = [h for h in pl.heard if h - pl.t_start > 3]
+            span = heard[-1] - heard[0]
+            intervals.append(span / round(span))
         return statuses, intervals
 
     def test_drift_is_corrected_on_a_live_cast_speaker(self):
@@ -812,7 +918,7 @@ esac
         try:
             from unittest import mock
             with mock.patch.multiple(drift, DLNA_POLL_S=(0.05, 0.1), WARMUP_S=0.5):
-                statuses, failures = self._run([fake.target()], silence(), seconds=2)
+                statuses, failures = self._run([fake.target()], silence(), seconds=4.5)
         finally:
             fake.close()
         self.assertEqual(failures, [])
@@ -881,6 +987,122 @@ esac
                 self._run([bad.target()], silence())
         finally:
             bad.close()
+
+    # ------------------------------------------------------------ picky DLNA speakers
+    def _quick_confirm(self):
+        from unittest import mock
+        return mock.patch.multiple(stream, CONFIRM_TIMEOUT_S=5.0, IDLE_GRACE_S=0.8)
+
+    def test_a_tv_that_only_plays_raw_l16_gets_it_first_time(self):
+        # What LG webOS TVs are reported to need: uncompressed audio only as audio/L16.
+        tv, worked = FakeDlna(plays=lambda mime, sized: mime.startswith("audio/L16")), {}
+        t = tv.target("Lounge TV")
+        t.key = "dlna:tv"
+        try:
+            with self._quick_confirm():
+                statuses, failures = self._run([t], stream.clicks(), seconds=4, on_route=worked.__setitem__)
+        finally:
+            tv.close()
+        self.assertEqual(failures, [])
+        self.assertEqual(tv.offered, ["audio/L16;rate=48000;channels=2|live"])
+        self.assertTrue(tv.player.heard)                                    # it really played the clicks
+        self.assertTrue(any("Streaming over DLNA" in s for s in statuses), statuses)
+        self.assertEqual(worked, {"dlna:tv": "L16"})
+
+    def test_a_speaker_that_only_plays_wav_is_found_by_trying_and_tried_first_next_time(self):
+        worked = {}
+        first = FakeDlna(plays=lambda mime, sized: mime == "audio/wav")
+        t = first.target("Den")
+        t.key = "dlna:den"
+        try:
+            with self._quick_confirm():
+                statuses, failures = self._run([t], stream.clicks(), seconds=6, on_route=worked.__setitem__)
+        finally:
+            first.close()
+        self.assertEqual(failures, [])
+        self.assertEqual(first.offered, ["audio/L16;rate=48000;channels=2|live", "audio/wav|live"])
+        self.assertTrue(first.player.heard)
+        self.assertEqual(worked, {"dlna:den": "WAV"})
+
+        again = FakeDlna(plays=lambda mime, sized: mime == "audio/wav")
+        t2 = again.target("Den")
+        t2.key, t2.route = "dlna:den", worked["dlna:den"]
+        try:
+            with self._quick_confirm():
+                self._run([t2], silence(), seconds=3.5)
+        finally:
+            again.close()
+        self.assertEqual(again.offered, ["audio/wav|live"])                 # straight to what worked
+
+    def test_a_speaker_that_needs_a_length_gets_one(self):
+        picky = FakeDlna(plays=lambda mime, sized: sized)
+        try:
+            with self._quick_confirm():
+                statuses, failures = self._run([picky.target()], silence(), seconds=8)
+        finally:
+            picky.close()
+        self.assertEqual(failures, [])
+        self.assertEqual(picky.offered[-1], "audio/L16;rate=48000;channels=2|sized")
+        self.assertEqual(picky.player.content_length, str(stream.SIZED_LENGTH))
+
+    def test_a_type_refused_outright_moves_straight_to_the_next(self):
+        strict = FakeDlna(rejects=lambda mime: mime.startswith("audio/L16"))
+        t0 = time.monotonic()
+        try:
+            with self._quick_confirm():
+                statuses, failures = self._run([strict.target()], silence(), seconds=3.5)
+        finally:
+            strict.close()
+        self.assertEqual(failures, [])
+        self.assertEqual(strict.offered[-1], "audio/wav|live")
+        self.assertTrue(any("Streaming over DLNA" in s for s in statuses), statuses)
+        self.assertLess(time.monotonic() - t0, 6)
+
+    def test_what_the_speaker_says_it_plays_decides_the_order(self):
+        wav_only = "http-get:*:audio/mpeg:*,http-get:*:audio/x-wav:*,http-get:*:video/mp4:*"
+        self.assertEqual(dlna.order(wav_only.split(","))[0], "WAV")
+        self.assertEqual(dlna.order(["http-get:*:audio/L16;rate=44100;channels=2:DLNA.ORG_PN=LPCM"])[0], "L16")
+        self.assertEqual(dlna.order([])[0], "L16")
+        hifi = FakeDlna(sinks=wav_only)
+        try:
+            with self._quick_confirm():
+                self._run([hifi.target()], silence(), seconds=3.5)
+        finally:
+            hifi.close()
+        self.assertIn("GetProtocolInfo", hifi.actions)
+        self.assertEqual(hifi.offered[0], "audio/wav|live")
+
+    def test_a_speaker_that_plays_nothing_is_reported_honestly(self):
+        dud = FakeDlna(plays=lambda mime, sized: False)
+        try:
+            with self._quick_confirm(), self.assertRaises(stream.StreamError) as caught:
+                self._run([dud.target("Old Receiver")], silence(), seconds=10)
+        finally:
+            dud.close()
+        msg = str(caught.exception)
+        self.assertIn("it took the stream but didn't play it", msg)
+        self.assertIn("tried L16; WAV; L16 with a length; WAV with a length", msg)
+        self.assertEqual(len(dud.offered), 4)
+        self.assertEqual(dud.actions[-1], "Stop")   # and its player isn't left sitting open
+
+    def test_a_speaker_stopped_from_its_own_remote_is_noticed(self):
+        tv = FakeDlna()
+        stop, statuses = threading.Event(), []
+
+        def press_stop():
+            while not any("Streaming over DLNA" in s for s in statuses):
+                time.sleep(0.05)
+            time.sleep(1)
+            tv.player.stop()
+            tv.state = "STOPPED"
+        threading.Thread(target=press_stop, daemon=True).start()
+        threading.Timer(15, stop.set).start()
+        try:
+            with self._quick_confirm(), self.assertRaisesRegex(stream.StreamError, "stopped the stream"):
+                stream.run([tv.target()], stop, source=silence(), on_status=statuses.append)
+        finally:
+            stop.set()
+            tv.close()
 
 
 if __name__ == "__main__":

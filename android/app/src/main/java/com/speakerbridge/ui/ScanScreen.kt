@@ -39,9 +39,13 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.derivedStateOf
@@ -56,7 +60,9 @@ import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.lerp
+import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.withStyle
@@ -64,7 +70,9 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.speakerbridge.model.Device
+import com.speakerbridge.playback.MicRecorder
 import com.speakerbridge.playback.PhoneStream
+import com.speakerbridge.playback.Route
 import com.speakerbridge.playback.StreamState
 import com.speakerbridge.playback.TestSound
 import com.speakerbridge.ui.theme.SB
@@ -151,7 +159,7 @@ fun ScanScreen(vm: ScanViewModel) {
             val playable = visible.filter { it.status != "not_speaker" && TestSound.canPlay(it) }
             if (playable.isNotEmpty()) {
                 item(key = "together") {
-                    PlayTogether(state, stream, playable, vm::toggleTogether, vm::playTogether,
+                    PlayTogether(state, stream, playable, vm,
                         onStream = startStream, onStopStream = { PhoneStream.stop(context) })
                     Hairline()
                 }
@@ -330,20 +338,40 @@ private fun Hero(state: UiState, speakers: Int, usable: Int) {
 
 @Composable
 private fun PlayTogether(
-    state: UiState, stream: StreamState, playable: List<Device>, onToggle: (Device) -> Unit, onPlay: () -> Unit,
+    state: UiState, stream: StreamState, playable: List<Device>, vm: ScanViewModel,
     onStream: () -> Unit, onStopStream: () -> Unit,
 ) {
     val picked = playable.count { it.key in state.together }
-    val busy = state.togetherBusy || stream.running
+    val busy = state.togetherBusy || stream.running || state.lab.isNotEmpty()
+    val clipboard = LocalClipboardManager.current
+    var askMic by remember { mutableStateOf(false) }
+    var micNote by remember { mutableStateOf<String?>(null) }
+    var copied by remember { mutableStateOf(false) }
+    val micPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+        if (granted) vm.lineUpWithMicrophone()
+        else micNote = "The microphone wasn't allowed, so the speakers can't be timed. Allow it in Settings → Apps → " +
+            "SpeakerBridge → Permissions, or line them up by ear with sync clicks."
+    }
+    if (askMic) {
+        AlertDialog(
+            onDismissRequest = { askMic = false },
+            title = { Text("Use the microphone?") },
+            text = { Text(MicRecorder.CONSENT) },
+            confirmButton = {
+                TextButton(onClick = { askMic = false; micNote = null; micPermission.launch(android.Manifest.permission.RECORD_AUDIO) }) {
+                    Text("Use microphone")
+                }
+            },
+            dismissButton = { TextButton(onClick = { askMic = false }) { Text("Not now") } },
+        )
+    }
     Column(Modifier.padding(horizontal = 18.dp, vertical = 18.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
         Text("PLAY TOGETHER", style = SBType.MonoLabel)
-        Text("Pick speakers, then stream whatever your phone is playing to all of them, or play the test " +
-            "chime on two or more at the same moment.",
-            style = SBType.BodySmall)
+        Text("Pick speakers, then stream whatever your phone is playing to all of them.", style = SBType.BodySmall)
         for (d in playable) {
             val on = d.key in state.together
             Row(
-                Modifier.fillMaxWidth().clickable(enabled = !busy) { onToggle(d) }.padding(vertical = 6.dp),
+                Modifier.fillMaxWidth().clickable(enabled = !busy) { vm.toggleTogether(d) }.padding(vertical = 6.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 Box(
@@ -356,14 +384,46 @@ private fun PlayTogether(
                 Text(if (d.isCastGroup) "GROUP" else d.protocols.keys.joinToString(" · ") { shortProto(it) }.uppercase(),
                     style = SBType.Mono.copy(color = SB.Dim), maxLines = 1)
             }
+            if (on) SyncRow(d, state.delays[d.key] ?: 0, state.routes[d.key], canChangeRoute = !busy,
+                onDelay = { vm.changeDelay(d, it) }, onRoute = { vm.cycleRoute(d) })
         }
         when {
             !PhoneStream.supported -> PillButton("Streaming needs Android 10", enabled = false) {}
             stream.running -> PillButton("Stop streaming", enabled = true, onClick = onStopStream)
             picked == 0 -> PillButton("Pick a speaker to stream", enabled = false) {}
-            else -> PillButton("Stream phone audio ($picked)", enabled = !state.togetherBusy, onClick = onStream)
+            else -> PillButton("Stream phone audio ($picked)", enabled = !busy, onClick = onStream)
         }
+        if (stream.running) when (stream.hearing) {
+            true -> Text("Sending your phone's sound.", style = SBType.BodySmall.copy(color = SB.Cream))
+            false -> Text(
+                "Only silence is reaching the speakers. Is something playing? Some apps (many video and " +
+                    "music apps) don't allow their sound to be shared. If this appeared just as you turned the " +
+                    "phone's volume down, your phone lowers what it shares too: turn it back up a little.",
+                style = SBType.BodySmall.copy(color = SB.Red),
+            )
+            null -> {}
+        }
+        stream.phone?.let { Text(it, style = SBType.BodySmall.copy(color = SB.Cream)) }
         stream.lines.forEach { Text(it, style = SBType.BodySmall.copy(color = SB.Cream)) }
+
+        Text("IN STEP", style = SBType.MonoLabel, modifier = Modifier.padding(top = 8.dp))
+        Text(
+            "Speakers buffer for different lengths of time, so at first they play apart. Give the ones that " +
+                "play early a sync delay so they wait for the slowest. The microphone can work the delays out " +
+                "for you, or play sync clicks and adjust each speaker until you hear one click. Delays are " +
+                "saved, and you can change them while music plays.",
+            style = SBType.BodySmall,
+        )
+        if (state.lab == "mic") PillButton("Stop listening", enabled = true, onClick = vm::stopLab)
+        else PillButton(if (picked < 2) "Microphone line-up needs two" else "Line up with microphone ($picked)",
+            enabled = picked >= 2 && !busy) { askMic = true }
+        if (state.lab == "clicks") PillButton("Stop sync clicks", enabled = true, onClick = vm::toggleClicks)
+        else PillButton(if (picked == 0) "Pick speakers for sync clicks" else "Play sync clicks ($picked)",
+            enabled = picked >= 1 && !busy, onClick = vm::toggleClicks)
+        micNote?.let { Text(it, style = SBType.BodySmall.copy(color = SB.Red)) }
+        state.labLines.forEach { Text(it, style = SBType.BodySmall.copy(color = SB.Cream)) }
+
+        Text("CHECK", style = SBType.MonoLabel, modifier = Modifier.padding(top = 8.dp))
         PillButton(
             when {
                 state.togetherBusy -> "Playing…"
@@ -371,22 +431,67 @@ private fun PlayTogether(
                 else -> "Play chime together ($picked)"
             },
             enabled = picked >= 2 && !busy,
-            onClick = onPlay,
+            onClick = vm::playTogether,
         )
         state.togetherLines.forEach { Text(it, style = SBType.BodySmall.copy(color = SB.Cream)) }
+        PillButton(if (copied) "Report copied" else "Copy report", enabled = true) {
+            clipboard.setText(AnnotatedString(vm.report()))
+            copied = true
+        }
+        Text(
+            "If a speaker won't play, copy the report and send it to whoever looks after the app: it lists what " +
+                "each speaker was offered and how it answered (speaker names, models and local addresses; no " +
+                "audio). It's only copied, never sent anywhere. Under each picked speaker, the route is how " +
+                "SpeakerBridge reaches it: \"auto\" tries each way until one plays; tap it to choose one yourself.",
+            style = SBType.BodySmall.copy(color = SB.Dim),
+        )
         Text(
             "Streaming sends your phone's sound, never its picture, and only over your Wi-Fi. Android asks to " +
                 "share your screen and to record audio because that's how it lets an app capture other apps' " +
-                "sound; the microphone isn't used. Some apps block capture (many video apps do), and your phone " +
-                "keeps playing too.",
+                "sound; the microphone is only used for the line-up above, and only when you say so. Some apps " +
+                "block capture (many video apps do).",
             style = SBType.BodySmall.copy(color = SB.Dim),
         )
         Text(
-            "Speakers of different brands can still land a fraction of a second apart. For Google Cast " +
-                "speakers, a speaker group made in the Google Home app keeps them perfectly in sync; it then " +
-                "shows up here as one speaker.",
+            "Android copies the sound rather than moving it, so SpeakerBridge mutes your phone once music " +
+                "starts (and unmutes it when you stop), so it doesn't play ahead of the speakers. If your phone " +
+                "can't stay muted while sharing, the app says so.",
             style = SBType.BodySmall.copy(color = SB.Dim),
         )
+        Text(
+            "For Google Cast speakers, a speaker group made in the Google Home app keeps them perfectly in " +
+                "sync by itself; it shows up here as one speaker.",
+            style = SBType.BodySmall.copy(color = SB.Dim),
+        )
+    }
+}
+
+/** A picked speaker's sync delay (with coarse and fine steps) and the route used to reach it. */
+@Composable
+private fun SyncRow(d: Device, delayMs: Int, route: String?, canChangeRoute: Boolean, onDelay: (Int) -> Unit, onRoute: () -> Unit) {
+    Row(Modifier.fillMaxWidth().padding(start = 28.dp), verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+        for (step in listOf(-100, -10)) StepButton("$step", enabled = delayMs > 0) { onDelay(step) }
+        for (step in listOf(10, 100)) StepButton("+$step", enabled = true) { onDelay(step) }
+        Text("DELAY $delayMs MS", style = SBType.Mono.copy(color = if (delayMs > 0) SB.Cream else SB.Dim),
+            modifier = Modifier.padding(start = 6.dp), maxLines = 1)
+    }
+    if (Route.possible(d).size > 1) {
+        Text(
+            "ROUTE: " + (Route.byId(route)?.label ?: "auto").uppercase(),
+            style = SBType.Mono.copy(color = if (route == null) SB.Dim else SB.Cream),
+            modifier = Modifier.padding(start = 28.dp).clickable(enabled = canChangeRoute, onClick = onRoute).padding(vertical = 4.dp),
+        )
+    }
+}
+
+@Composable
+private fun StepButton(text: String, enabled: Boolean, onClick: () -> Unit) {
+    Box(
+        Modifier.border(1.dp, SB.Line, RoundedCornerShape(3.dp)).clickable(enabled = enabled, onClick = onClick)
+            .padding(horizontal = 8.dp, vertical = 5.dp),
+    ) {
+        Text(text, style = SBType.Mono.copy(color = if (enabled) SB.Cream else SB.Dim))
     }
 }
 

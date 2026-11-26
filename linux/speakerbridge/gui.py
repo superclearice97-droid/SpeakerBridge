@@ -57,7 +57,8 @@ class StreamWorker(QObject):
 
     def run(self) -> None:
         try:
-            failures = stream.run(self.targets, self.stop, source=self.source, on_status=self.status.emit)
+            failures = stream.run(self.targets, self.stop, source=self.source, on_status=self.status.emit,
+                                  on_route=store.save_route)
             self.done.emit(("Sync clicks stopped." if self.source else
                             "Stream stopped. Audio is back on this computer.")
                            + (f" Not played on: {'; '.join(failures)}" if failures else ""))
@@ -312,9 +313,10 @@ class MainWindow(QMainWindow):
         targets = self.streamable_selection()
         if not targets:
             return
-        saved = store.delays()
+        saved, worked = store.delays(), store.routes()
         for t in targets:
             t.delay_ms = saved.get(t.key, 0)
+            t.route = worked.get(t.key, "")
         self.stream_thread = QThread(self)
         self.stream_worker = StreamWorker(targets, stream.clicks() if self.clicks_box.isChecked() else None)
         self.stream_worker.moveToThread(self.stream_thread)

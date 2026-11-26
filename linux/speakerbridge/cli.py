@@ -140,9 +140,10 @@ def stream_main(argv: list[str] | None = None) -> int:
         return 1
 
     targets = [stream.target_for(d) for d in chosen]
-    saved = store.delays()
+    saved, worked = store.delays(), store.routes()
     for t in targets:
         t.delay_ms = saved.get(t.key, 0)
+        t.route = worked.get(t.key, "")
     if args.calibrate:
         return calibrate(targets)
     if args.auto_calibrate:
@@ -154,7 +155,7 @@ def stream_main(argv: list[str] | None = None) -> int:
     print("Note: speakers buffer a second or two, so this suits music, not lip-synced video yet.")
     stop = threading.Event()
     try:
-        failures = stream.run(targets, stop, fmt=args.format)
+        failures = stream.run(targets, stop, fmt=args.format, on_route=store.save_route)
     except KeyboardInterrupt:
         print("\nStopping… audio is switching back to this computer.")
         return 0

@@ -16,6 +16,8 @@ import kotlin.math.sin
 object TestTone {
     const val SAMPLE_RATE = 44100
     const val CONTENT_TYPE = "audio/wav"
+    /** The same chime as raw big-endian PCM, the form every DLNA audio player must accept. */
+    const val L16_CONTENT_TYPE = "audio/L16;rate=44100;channels=1"
     private const val LEAD_IN_S = 0.3        // a little silence so the speaker doesn't clip the first note
     private const val NOTE_GAP_S = 0.25
     private const val NOTE_LEN_S = 1.8
@@ -50,12 +52,14 @@ object TestTone {
 }
 
 /**
- * Serves one file over HTTP on the phone's Wi-Fi address so the speaker can fetch it.
- * LAN only; it stops as soon as it is closed.
+ * Serves the chime over HTTP on the phone's Wi-Fi address so the speaker can fetch it, as a
+ * WAV file ([url]) or as raw L16 PCM ([urlL16]). LAN only; it stops as soon as it is closed.
  */
-class ToneServer(bindAddr: InetAddress, private val body: ByteArray, private val contentType: String) : Closeable {
+class ToneServer(bindAddr: InetAddress, private val wav: ByteArray, private val contentType: String) : Closeable {
     private val server = ServerSocket(0, 8, bindAddr)
+    private val l16 = LiveStreamServer.swapped(wav.copyOfRange(44, wav.size))
     val url = "http://${bindAddr.hostAddress}:${server.localPort}/$PATH"
+    val urlL16 = "http://${bindAddr.hostAddress}:${server.localPort}/$PATH_L16"
 
     init {
         Thread {
@@ -80,9 +84,13 @@ class ToneServer(bindAddr: InetAddress, private val body: ByteArray, private val
         }
         val parts = request.split(' ')
         val out = c.getOutputStream()
-        if (parts.size < 2 || parts[1].substringBefore('?') != "/$PATH") {
-            out.write("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".toByteArray())
-            return
+        val (body, contentType) = when (parts.getOrNull(1)?.substringBefore('?')) {
+            "/$PATH" -> wav to contentType
+            "/$PATH_L16" -> l16 to TestTone.L16_CONTENT_TYPE
+            else -> {
+                out.write("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".toByteArray())
+                return
+            }
         }
         var start = 0
         var end = body.size - 1
@@ -110,5 +118,8 @@ class ToneServer(bindAddr: InetAddress, private val body: ByteArray, private val
 
     override fun close() = server.close()
 
-    private companion object { const val PATH = "speakerbridge-test.wav" }
+    private companion object {
+        const val PATH = "speakerbridge-test.wav"
+        const val PATH_L16 = "speakerbridge-test.l16"
+    }
 }

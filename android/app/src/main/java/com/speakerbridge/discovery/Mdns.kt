@@ -108,6 +108,7 @@ object MdnsWire {
         repeat(qd) { off = readName(data, off).second + 4 }
         val out = mutableListOf<Record>()
         repeat(total) {
+            if (off >= data.size) return out   // fewer records than the header claims (truncated replies happen)
             val (name, after) = readName(data, off)
             off = after
             if (off + 10 > data.size) return out

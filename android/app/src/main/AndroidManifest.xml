@@ -6,7 +6,8 @@
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
     <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
     <!-- Streaming this phone's audio: Android requires the recording permission for capturing
-         app audio (the microphone itself isn't used), plus a foreground service while it runs. -->
+         app audio, plus a foreground service while it runs. The microphone itself is used only for
+         the "Line up with microphone" feature, after the user agrees each time. -->
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />

@@ -23,6 +23,10 @@ def _delays_path() -> Path:
     return config_dir() / "delays.json"
 
 
+def _routes_path() -> Path:
+    return config_dir() / "routes.json"
+
+
 def _load(path: Path) -> dict:
     try:
         with open(path, encoding="utf-8") as f:
@@ -63,6 +67,18 @@ def unmark_verified(key: str) -> None:
 def delays() -> dict[str, int]:
     """{device key: sync delay in ms} for speakers you have lined up."""
     return {k: v for k, v in _load(_delays_path()).items() if isinstance(v, int)}
+
+
+def routes() -> dict[str, str]:
+    """{device key: the DLNA stream form that last played on it}, to try first next time."""
+    return {k: v for k, v in _load(_routes_path()).items() if isinstance(v, str)}
+
+
+def save_route(key: str, form: str) -> None:
+    data = routes()
+    if data.get(key) != form:
+        data[key] = form
+        _save(data, _routes_path())
 
 
 def save_delay(key: str, ms: int) -> None:
